@@ -39,7 +39,15 @@ class SchedulerPlugin(object):
     >>> scheduler.add_plugin(c)  # doctest: +SKIP
     """
 
-    def update_graph(self, scheduler, dsk=None, keys=None, restrictions=None, **kwargs):
+    def update_graph(
+        self,
+        scheduler,
+        dsk=None,
+        keys=None,
+        restrictions=None,
+        recommendations=None,
+        **kwargs
+    ):
         """ Run when a new graph / tasks enter the scheduler """
 
     def restart(self, scheduler, **kwargs):
@@ -56,6 +64,9 @@ class SchedulerPlugin(object):
             One of released, waiting, processing, memory, error.
         finish: string
             Final state of the transition.
+        recommendations: OrderedDict[str, str]
+            Current recommendations for transitions of of keys to new states.
+            The plugin may mutate this to alter scheduling.
         *args, **kwargs: More options passed when transitioning
             This may include worker ID, compute time, etc.
         """

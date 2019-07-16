@@ -1744,6 +1744,7 @@ class Scheduler(ServerNode):
                     priority=priority,
                     loose_restrictions=loose_restrictions,
                     resources=resources,
+                    recommendations=recommendations,
                 )
             except Exception as e:
                 logger.exception(e)
@@ -4301,7 +4302,14 @@ class Scheduler(ServerNode):
                     self.tasks[ts.key] = ts
                 for plugin in list(self.plugins):
                     try:
-                        plugin.transition(key, start, finish2, *args, **kwargs)
+                        plugin.transition(
+                            key,
+                            start,
+                            finish2,
+                            *args,
+                            recommendations=recommendations,
+                            **kwargs
+                        )
                     except Exception:
                         logger.info("Plugin failed with exception", exc_info=True)
                 if ts.state == "forgotten":
