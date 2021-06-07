@@ -64,6 +64,7 @@ distributed:
     blocked-handlers: []
     multiprocessing-method: spawn
     use-file-locking: True
+    batched-send-interval: 2ms
     connections:            # Maximum concurrent connections for data
       outgoing: 50          # This helps to control network saturation
       incoming: 10

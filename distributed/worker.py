@@ -651,7 +651,10 @@ class Worker(ServerNode):
                 self.nthreads, thread_name_prefix="Dask-Default-Threads"
             )
 
-        self.batched_stream = BatchedSend(interval="2ms", loop=self.loop)
+        self.batched_stream = BatchedSend(
+            interval=dask.config.get("distributed.worker.batched-send-interval"),
+            loop=self.loop,
+        )
         self.name = name
         self.scheduler_delay = 0
         self.stream_comms = dict()

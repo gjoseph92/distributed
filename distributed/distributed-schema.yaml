@@ -279,6 +279,13 @@ properties:
               To avoid this, Dask usually used a file-based lock.
               However, on some systems file-based locks don't work.
               This is particularly common on HPC NFS systems, where users may want to set this to false.
+          batched-send-interval:
+            type: string
+            description: |
+              Minimum interval at which to send updates to the scheduler.
+
+              Worker status update messages occurring more frequently than
+              this interval will be batched.
           connections:
             type: object
             description: |
