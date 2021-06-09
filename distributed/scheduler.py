@@ -2327,34 +2327,39 @@ class SchedulerState:
             ts.state = "no-worker"
             return ws
 
-        if ts._dependencies or valid_workers is not None:
-            ws = decide_worker(
+        # if ts._dependencies or valid_workers is not None:
+        ws = decide_worker(
+            ts,
+            self._workers_dv.values(),
+            valid_workers,
+            partial(
+                self.worker_objective
+                if ts._dependencies
+                else self.worker_objective_root,
                 ts,
-                self._workers_dv.values(),
-                valid_workers,
-                partial(self.worker_objective, ts),
-            )
-        else:
-            worker_pool = self._idle or self._workers
-            worker_pool_dv = cast(dict, worker_pool)
-            wp_vals = worker_pool.values()
-            n_workers: Py_ssize_t = len(worker_pool_dv)
-            if n_workers < 20:  # smart but linear in small case
-                ws = min(wp_vals, key=operator.attrgetter("occupancy"))
-                if ws._occupancy == 0:
-                    # special case to use round-robin; linear search
-                    # for next worker with zero occupancy (or just
-                    # land back where we started).
-                    wp_i: WorkerState
-                    start: Py_ssize_t = self._n_tasks % n_workers
-                    i: Py_ssize_t
-                    for i in range(n_workers):
-                        wp_i = wp_vals[(i + start) % n_workers]
-                        if wp_i._occupancy == 0:
-                            ws = wp_i
-                            break
-            else:  # dumb but fast in large case
-                ws = wp_vals[self._n_tasks % n_workers]
+            ),
+        )
+        # else:
+        #     worker_pool = self._idle or self._workers
+        #     worker_pool_dv = cast(dict, worker_pool)
+        #     wp_vals = worker_pool.values()
+        #     n_workers: Py_ssize_t = len(worker_pool_dv)
+        #     if n_workers < 20:  # smart but linear in small case
+        #         ws = min(wp_vals, key=operator.attrgetter("occupancy"))
+        #         if ws._occupancy == 0:
+        #             # special case to use round-robin; linear search
+        #             # for next worker with zero occupancy (or just
+        #             # land back where we started).
+        #             wp_i: WorkerState
+        #             start: Py_ssize_t = self._n_tasks % n_workers
+        #             i: Py_ssize_t
+        #             for i in range(n_workers):
+        #                 wp_i = wp_vals[(i + start) % n_workers]
+        #                 if wp_i._occupancy == 0:
+        #                     ws = wp_i
+        #                     break
+        #     else:  # dumb but fast in large case
+        #         ws = wp_vals[self._n_tasks % n_workers]
 
         if self._validate:
             assert ws is None or isinstance(ws, WorkerState), (
@@ -3215,6 +3220,45 @@ class SchedulerState:
             return (len(ws._actors), start_time, ws._nbytes)
         else:
             return (start_time, ws._nbytes)
+
+    @ccall
+    @exceptval(check=False)
+    def worker_objective_root(self, ts: TaskState, ws: WorkerState) -> tuple:
+        """
+        Objective function to determine which worker should get a root task
+
+        Minimize the spread in task priorities on a worker within this task's group.
+        If a tie, then pick the worker with more free memory.
+        """
+        assert not ts._actor  # TODO
+        MAXINT = 9223372036854775807  # TODO get actual maxint value from cython?
+
+        wts: TaskState
+        target_priority: int = ts._priority[-1]
+
+        group_tasks_per_worker = math.floor(len(ts._group) / self._total_nthreads)
+
+        # FIXME for each task, this ends up scanning every running task: O(n^2)
+        # But it's a stateless form of the metric we want.
+        priority_distance: int = 0
+        relatives_on_worker: int = 0
+        if not ws._processing:  # TODO what about sibling tasks that are already done processing?
+            # Avoid empty workers when there are un-saturated workers with related tasks
+            # TODO is there a way to rank without using MAXINT?
+            priority_distance = MAXINT - 1
+        else:
+            for wts in ws._processing:
+                if wts._group is ts._group:
+                    relatives_on_worker += 1
+                    if relatives_on_worker >= group_tasks_per_worker:
+                        priority_distance = (
+                            MAXINT  # Avoid saturated workers even more than empty ones
+                        )
+                        break
+
+                    priority_distance += abs(wts._priority[-1] - target_priority)
+
+        return (priority_distance, ws._nbytes)
 
 
 class Scheduler(SchedulerState, ServerNode):
