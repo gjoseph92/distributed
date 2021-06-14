@@ -1,9 +1,13 @@
 import itertools
+import logging
 
 import dask
 
 from ..utils import get_ip_interface
 from . import registry
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_address(addr, strict=False):
@@ -27,6 +31,10 @@ def parse_address(addr, strict=False):
         raise ValueError(msg)
     if not sep:
         scheme = dask.config.get("distributed.comm.default-scheme")
+
+    if scheme != "ucx":
+        logging.warning(f"Coercing scheme from {scheme!r} to 'ucx' for {addr!r}")
+        scheme = "ucx"
     return scheme, loc
 
 
