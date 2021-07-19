@@ -53,6 +53,7 @@ class BatchedSend:
         self.recent_message_log = deque(
             maxlen=dask.config.get("distributed.comm.recent-messages-log-length")
         )
+        self.buffer_sizes_at_send = []
         self.serializers = serializers
         self._consecutive_failures = 0
 
@@ -98,6 +99,7 @@ class BatchedSend:
                 else:
                     self.recent_message_log.append("large-message")
                 self.byte_count += nbytes
+                self.buffer_sizes_at_send.append((len(payload), nbytes))
             except CommClosedError as e:
                 logger.info("Batched Comm Closed: %s", e)
                 break
@@ -156,9 +158,10 @@ class BatchedSend:
             try:
                 if self.buffer:
                     self.buffer, payload = [], self.buffer
-                    yield self.comm.write(
+                    nbytes = yield self.comm.write(
                         payload, serializers=self.serializers, on_error="raise"
                     )
+                    self.buffer_sizes_at_send.append((len(payload), nbytes))
             except CommClosedError:
                 pass
             yield self.comm.close()
