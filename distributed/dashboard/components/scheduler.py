@@ -39,7 +39,7 @@ from bokeh.models.widgets.markups import Div
 from bokeh.palettes import Viridis11
 from bokeh.plotting import figure
 from bokeh.themes import Theme
-from bokeh.transform import cumsum, factor_cmap, linear_cmap
+from bokeh.transform import cumsum, linear_cmap
 from tlz import curry, pipe
 from tlz.curried import concat, groupby, map
 from tornado import escape
@@ -1614,10 +1614,17 @@ class TaskGraph(DashboardComponent):
             filters=[GroupFilter(column_name="visible", group="True")],
         )
 
-        node_colors = factor_cmap(
-            "state",
-            factors=["waiting", "processing", "memory", "released", "erred"],
-            palette=["gray", "green", "red", "blue", "black"],
+        # node_colors = factor_cmap(
+        #     "state",
+        #     factors=["waiting", "processing", "memory", "released", "erred"],
+        #     palette=["gray", "green", "red", "blue", "black"],
+        # )
+        worker_colors = linear_cmap(
+            "worker",
+            Viridis11,  # TODO larger cmap for more workers
+            low=0,
+            high=11,  # TODO actually set this, and update when workers add/leave!!!
+            nan_color="black",
         )
 
         self.root = figure(title="Task Graph", **kwargs)
@@ -1637,7 +1644,8 @@ class TaskGraph(DashboardComponent):
             x="x",
             y="y",
             size=10,
-            color=node_colors,
+            # line_color=node_colors,
+            color=worker_colors,
             source=self.node_source,
             view=node_view,
             **{"legend_field" if BOKEH_VERSION >= "1.4" else "legend": "state"},
@@ -1647,7 +1655,7 @@ class TaskGraph(DashboardComponent):
 
         hover = HoverTool(
             point_policy="follow_mouse",
-            tooltips="<b>@name</b>: @state",
+            tooltips="<b>@name</b>: @state @worker",
             renderers=[rect],
         )
         tap = TapTool(callback=OpenURL(url="info/task/@key.html"), renderers=[rect])
@@ -1697,6 +1705,7 @@ class TaskGraph(DashboardComponent):
             node_name = []
             edge_x = []
             edge_y = []
+            worker = []
 
             x = self.layout.x
             y = self.layout.y
@@ -1714,6 +1723,11 @@ class TaskGraph(DashboardComponent):
                 node_y.append(yy)
                 node_state.append(task.state)
                 node_name.append(task.prefix.name)
+                ws = task.processing_on or (
+                    next(iter(task.who_has)) if task.who_has else None
+                )
+                # TODO don't rely on worker name being int-like; use categorical cmap instead
+                worker.append(int(ws.name) if ws else None)
 
             for a, b in new_edges:
                 try:
@@ -1729,6 +1743,7 @@ class TaskGraph(DashboardComponent):
                 "name": node_name,
                 "key": node_key,
                 "visible": ["True"] * len(node_x),
+                "worker": worker,
             }
             edge = {"x": edge_x, "y": edge_y, "visible": ["True"] * len(edge_x)}
 
@@ -1753,6 +1768,12 @@ class TaskGraph(DashboardComponent):
             self.layout.state_updates = []
             updates = [(i, c) for i, c in state_updates if i < n]
             self.node_source.patch({"state": updates})
+
+        if self.layout.worker_updates:
+            worker_updates = self.layout.worker_updates
+            self.layout.worker_updates = []
+            updates = [(i, c) for i, c in worker_updates if i < n]
+            self.node_source.patch({"worker": updates})
 
         if self.layout.visible_updates:
             updates = self.layout.visible_updates
