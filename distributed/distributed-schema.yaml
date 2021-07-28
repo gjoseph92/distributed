@@ -162,6 +162,15 @@ properties:
               Whether or not to run consistency checks during execution.
               This is typically only used for debugging.
 
+          msgs-per-sec:
+            type: integer
+            minimum: 1
+            description: |
+              Approximately how many worker updates we want to receive per second.
+
+              As the cluster scales, workers will adjust the batching interval of their
+              messages to meet this target.
+
           dashboard:
             type: object
             description: |

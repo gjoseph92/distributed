@@ -7753,14 +7753,17 @@ def heartbeat_interval(n):
         return n / 200 + 1
 
 
+SCHEDULER_MSG_PER_SEC = dask.config.get("distributed.scheduler.msgs-per-sec")
+
+
 def batched_send_interval(n):
     """
     Interval in seconds that we desire each worker to send updates, based on number of workers
 
-    Target is 5,000 messages received per second; capped between 5ms and 100ms.
+    Target is 5,000 messages received per second; capped between 5ms and 200ms.
     """
-    target = n / 5000
-    return max(0.005, min(0.1, target))
+    interval = (n / SCHEDULER_MSG_PER_SEC) if SCHEDULER_MSG_PER_SEC > 0 else 0
+    return max(0.005, min(0.2, interval))
 
 
 class KilledWorker(Exception):
