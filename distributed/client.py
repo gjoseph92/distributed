@@ -7,8 +7,10 @@ import inspect
 import json
 import logging
 import os
+import re
 import sys
 import threading
+import traceback
 import uuid
 import warnings
 import weakref
@@ -2566,6 +2568,41 @@ class Client:
         """
         return self.run(function, *args, **kwargs)
 
+    @staticmethod
+    def _get_computation_code() -> str:
+        """Walk up the stack to the user code and extract the code surrounding
+        the compute/submit/persist call. All modules encountered which are
+        blacklisted by the option
+        `distributed.diagnostics.computations.ignore-modules` will be ignored.
+        This can be used to blacklist commonly used libraries which wrap
+        dask/distributed compute calls.
+        """
+
+        ignore_modules = dask.config.get(
+            "distributed.diagnostics.computations.ignore-modules"
+        )
+        if not isinstance(ignore_modules, list):
+            raise TypeError(
+                f"Ignored modules must be a list. Instead got ({type(ignore_modules)}, {ignore_modules})"
+            )
+
+        if ignore_modules:
+            pattern = "|".join([f"(?:{mod})" for mod in ignore_modules])
+            pattern = re.compile(pattern)
+        else:
+            pattern = None
+
+        for fr, _ in traceback.walk_stack(None):
+            if pattern is None or (
+                not pattern.match(fr.f_globals["__name__"])
+                and fr.f_code.co_name not in ("<listcomp>", "<dictcomp>")
+            ):
+                try:
+                    return inspect.getsource(fr)
+                except OSError:
+                    break
+        return "<Code not available>"
+
     def _graph_to_futures(
         self,
         dsk,
@@ -2612,6 +2649,7 @@ class Client:
 
             # Create futures before sending graph (helps avoid contention)
             futures = {key: Future(key, self, inform=False) for key in keyset}
+
             self._send_to_scheduler(
                 {
                     "op": "update-graph-hlg",
@@ -2621,6 +2659,7 @@ class Client:
                     "submitting_task": getattr(thread_state, "key", None),
                     "fifo_timeout": fifo_timeout,
                     "actors": actors,
+                    "code": self._get_computation_code(),
                 }
             )
             return futures
@@ -3095,11 +3134,9 @@ class Client:
         else:
             keys = None
         result = await self.scheduler.rebalance(keys=keys, workers=workers)
-        if result["status"] == "missing-data":
-            raise KeyError(
-                f"During rebalance {len(result['keys'])} keys were found to be missing"
-            )
-        assert result["status"] == "OK"
+        if result["status"] == "partial-fail":
+            raise KeyError(f"Could not rebalance keys: {result['keys']}")
+        assert result["status"] == "OK", result
 
     def rebalance(self, futures=None, workers=None, **kwargs):
         """Rebalance data within network
@@ -4405,9 +4442,11 @@ class as_completed:
         """Add multiple futures to the collection.
 
         The added futures will emit from the iterator once they finish"""
+        from .actor import ActorFuture
+
         with self.lock:
             for f in futures:
-                if not isinstance(f, Future):
+                if not isinstance(f, (Future, ActorFuture)):
                     raise TypeError("Input must be a future, got %s" % f)
                 self.futures[f] += 1
                 self.loop.add_callback(self._track_future, f)
@@ -4747,13 +4786,15 @@ class performance_report:
 
     Parameters
     ----------
-    filename: str (optional)
+    filename: str, optional
         The filename to save the performance report locally
 
-    stacklevel: int (optional)
+    stacklevel: int, optional
         The code execution frame utilized for populating the Calling Code section
         of the report. Defaults to `1` which is the frame calling ``performance_report``
 
+    mode: str, optional
+        Mode parameter to pass to :func:`bokeh.io.output.output_file`. Defaults to ``None``.
 
     Examples
     --------
@@ -4764,10 +4805,11 @@ class performance_report:
     $ open myfile.html
     """
 
-    def __init__(self, filename="dask-report.html", stacklevel=1):
+    def __init__(self, filename="dask-report.html", stacklevel=1, mode=None):
         self.filename = filename
         # stacklevel 0 or less - shows dask internals which likely isn't helpful
         self._stacklevel = stacklevel if stacklevel > 0 else 1
+        self.mode = mode
 
     async def __aenter__(self):
         self.start = time()
@@ -4784,7 +4826,7 @@ class performance_report:
             except Exception:
                 code = ""
         data = await get_client().scheduler.performance_report(
-            start=self.start, last_count=self.last_count, code=code
+            start=self.start, last_count=self.last_count, code=code, mode=self.mode
         )
         with open(self.filename, "w") as f:
             f.write(data)
