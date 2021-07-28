@@ -1,7 +1,9 @@
+import asyncio
+import datetime
 import logging
 from collections import deque
+from typing import Optional, Union
 
-from tornado import gen, locks
 from tornado.ioloop import IOLoop
 
 import dask
@@ -41,8 +43,8 @@ class BatchedSend:
         # XXX is the loop arg useful?
         self.loop = loop or IOLoop.current()
         self.interval = parse_timedelta(interval, default="ms")
-        self.waker = locks.Event()
-        self.stopped = locks.Event()
+        self.waker = asyncio.Event()
+        self.stopped = asyncio.Event()
         self.please_stop = False
         self.buffer = []
         self.comm = None
@@ -71,13 +73,19 @@ class BatchedSend:
 
     __str__ = __repr__
 
-    @gen.coroutine
-    def _background_send(self):
+    async def _background_send(self):
         while not self.please_stop:
             try:
-                yield self.waker.wait(self.next_deadline)
+                await asyncio.wait_for(
+                    self.waker.wait(),
+                    timeout=(
+                        self.next_deadline - self.loop.time()
+                        if self.next_deadline is not None
+                        else None
+                    ),
+                )
                 self.waker.clear()
-            except gen.TimeoutError:
+            except asyncio.TimeoutError:
                 pass
             if not self.buffer:
                 # Nothing to send
@@ -90,7 +98,7 @@ class BatchedSend:
             self.batch_count += 1
             self.next_deadline = self.loop.time() + self.interval
             try:
-                nbytes = yield self.comm.write(
+                nbytes = await self.comm.write(
                     payload, serializers=self.serializers, on_error="raise"
                 )
                 if nbytes < 1e6:
@@ -141,27 +149,28 @@ class BatchedSend:
         if self.next_deadline is None:
             self.waker.set()
 
-    @gen.coroutine
-    def close(self, timeout=None):
+    async def close(self, timeout: Optional[Union[float, datetime.timedelta]] = None):
         """Flush existing messages and then close comm
 
-        If set, raises `tornado.util.TimeoutError` after a timeout.
+        If set, raises `asyncio.TimeoutError` after a timeout.
         """
         if self.comm is None:
             return
         self.please_stop = True
         self.waker.set()
-        yield self.stopped.wait(timeout=timeout)
+        if isinstance(timeout, datetime.timedelta):
+            timeout = timeout.total_seconds()
+        await asyncio.wait_for(self.stopped.wait(), timeout=timeout)
         if not self.comm.closed():
             try:
                 if self.buffer:
                     self.buffer, payload = [], self.buffer
-                    yield self.comm.write(
+                    await self.comm.write(
                         payload, serializers=self.serializers, on_error="raise"
                     )
             except CommClosedError:
                 pass
-            yield self.comm.close()
+            await self.comm.close()
 
     def abort(self):
         if self.comm is None:
