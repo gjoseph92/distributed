@@ -45,6 +45,7 @@ class BatchedSend:
         self.interval = parse_timedelta(interval, default="ms")
         self.waker = asyncio.Event()
         self.stopped = asyncio.Event()
+        self._future = None
         self.please_stop = False
         self.buffer = []
         self.comm = None
@@ -60,7 +61,14 @@ class BatchedSend:
 
     def start(self, comm):
         self.comm = comm
-        self.loop.add_callback(self._background_send)
+        try:
+            aio_loop = self.loop.asyncio_loop
+        except AttributeError:
+            self.loop.add_callback(self._background_send)
+        else:
+            self._future = asyncio.run_coroutine_threadsafe(
+                self._background_send(), aio_loop
+            )
 
     def closed(self):
         return self.comm and self.comm.closed()
@@ -160,7 +168,11 @@ class BatchedSend:
         self.waker.set()
         if isinstance(timeout, datetime.timedelta):
             timeout = timeout.total_seconds()
-        await asyncio.wait_for(self.stopped.wait(), timeout=timeout)
+        try:
+            await asyncio.wait_for(self.stopped.wait(), timeout=timeout)
+        finally:
+            if self._future:
+                self._future.cancel()
         if not self.comm.closed():
             try:
                 if self.buffer:
