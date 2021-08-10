@@ -84,9 +84,11 @@ env = Environment(
     )
 )
 
-BOKEH_THEME = Theme(os.path.join(os.path.dirname(__file__), "..", "theme.yaml"))
+BOKEH_THEME = Theme(
+    filename=os.path.join(os.path.dirname(__file__), "..", "theme.yaml")
+)
 TICKS_1024 = {"base": 1024, "mantissas": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]}
-XLABEL_ORIENTATION = -math.pi / 12  # slanted downwards 15 degrees
+XLABEL_ORIENTATION = -math.pi / 9  # slanted downwards 20 degrees
 
 
 logos_dict = {
@@ -117,12 +119,14 @@ class Occupancy(DashboardComponent):
             self.root = figure(
                 title="Occupancy",
                 tools="",
+                toolbar_location="above",
                 id="bk-occupancy-plot",
                 x_axis_type="datetime",
+                min_border_bottom=50,
                 **kwargs,
             )
             rect = self.root.rect(
-                source=self.source, x="x", width="ms", y="y", height=1, color="color"
+                source=self.source, x="x", width="ms", y="y", height=0.9, color="color"
             )
             rect.nonselection_glyph = None
 
@@ -258,6 +262,7 @@ class ClusterMemory(DashboardComponent):
                 id="bk-cluster-memory-plot",
                 width=int(width / 2),
                 name="cluster_memory",
+                min_border_bottom=50,
                 **kwargs,
             )
             rect = self.root.rect(
@@ -265,7 +270,7 @@ class ClusterMemory(DashboardComponent):
                 x="x",
                 y="y",
                 width="width",
-                height=1,
+                height=0.9,
                 color="color",
                 alpha="alpha",
             )
@@ -374,6 +379,7 @@ class WorkersMemory(DashboardComponent):
                 id="bk-workers-memory-plot",
                 width=int(width / 2),
                 name="workers_memory",
+                min_border_bottom=50,
                 **kwargs,
             )
             rect = self.root.rect(
@@ -381,7 +387,7 @@ class WorkersMemory(DashboardComponent):
                 x="x",
                 y="y",
                 width="width",
-                height=1,
+                height=0.9,
                 color="color",
                 fill_alpha="alpha",
                 line_width=0,
@@ -584,7 +590,7 @@ class BandwidthTypes(DashboardComponent):
                 x="bandwidth-half",
                 y="type",
                 width="bandwidth",
-                height=1,
+                height=0.9,
                 color="blue",
             )
             self.root.x_range.start = 0
@@ -1043,8 +1049,6 @@ class ComputePerKey(DashboardComponent):
             )
 
             fig.y_range.start = 0
-            fig.min_border_right = 20
-            fig.min_border_bottom = 60
             fig.yaxis.axis_label = "Time (s)"
             fig.yaxis[0].formatter = NumeralTickFormatter(format="0")
             fig.yaxis.ticker = AdaptiveTicker(**TICKS_1024)
@@ -1209,8 +1213,6 @@ class AggregateAction(DashboardComponent):
             )
 
             self.root.y_range.start = 0
-            self.root.min_border_right = 20
-            self.root.min_border_bottom = 60
             self.root.yaxis[0].formatter = NumeralTickFormatter(format="0")
             self.root.yaxis.axis_label = "Time (s)"
             self.root.yaxis.ticker = AdaptiveTicker(**TICKS_1024)
@@ -1368,6 +1370,7 @@ class CurrentLoad(DashboardComponent):
                 id="bk-nprocessing-plot",
                 name="processing",
                 width=int(width / 2),
+                min_border_bottom=50,
                 **kwargs,
             )
             rect = processing.rect(
@@ -1375,7 +1378,7 @@ class CurrentLoad(DashboardComponent):
                 x="nprocessing-half",
                 y="y",
                 width="nprocessing",
-                height=1,
+                height=0.9,
                 color="nprocessing-color",
             )
             processing.x_range.start = 0
@@ -1388,6 +1391,7 @@ class CurrentLoad(DashboardComponent):
                 width=int(width / 2),
                 name="cpu_hist",
                 x_range=(0, 100),
+                min_border_bottom=50,
                 **kwargs,
             )
             rect = cpu.rect(
@@ -1395,7 +1399,7 @@ class CurrentLoad(DashboardComponent):
                 x="cpu-half",
                 y="y",
                 width="cpu",
-                height=1,
+                height=0.9,
                 color="blue",
             )
             rect.nonselection_glyph = None
@@ -1814,8 +1818,9 @@ def task_stream_figure(clear_interval="20s", **kwargs):
         y_range=y_range,
         toolbar_location="above",
         x_axis_type="datetime",
-        min_border_right=35,
+        y_axis_location=None,
         tools="",
+        min_border_bottom=50,
         **kwargs,
     )
 
@@ -2520,6 +2525,7 @@ class TaskProgress(DashboardComponent):
             y_range=y_range,
             toolbar_location=None,
             tools="",
+            min_border_bottom=50,
             **kwargs,
         )
         self.root.line(  # just to define early ranges
@@ -2816,6 +2822,7 @@ class WorkerTable(DashboardComponent):
             height=60,
             width=width,
             tools="",
+            min_border_right=0,
             **kwargs,
         )
         mem_plot.circle(
@@ -2845,6 +2852,7 @@ class WorkerTable(DashboardComponent):
             height=60,
             width=width,
             tools="",
+            min_border_right=0,
             **kwargs,
         )
         cpu_plot.circle(
@@ -3134,7 +3142,7 @@ def individual_doc(cls, interval, scheduler, extra, doc, fig_attr="root", **kwar
 
 def individual_profile_doc(scheduler, extra, doc):
     with log_errors():
-        prof = ProfileTimePlot(scheduler, sizing_mode="scale_width", doc=doc)
+        prof = ProfileTimePlot(scheduler, sizing_mode="stretch_both", doc=doc)
         doc.add_root(prof.root)
         prof.trigger_update()
         doc.theme = BOKEH_THEME
@@ -3142,7 +3150,7 @@ def individual_profile_doc(scheduler, extra, doc):
 
 def individual_profile_server_doc(scheduler, extra, doc):
     with log_errors():
-        prof = ProfileServer(scheduler, sizing_mode="scale_width", doc=doc)
+        prof = ProfileServer(scheduler, sizing_mode="stretch_both", doc=doc)
         doc.add_root(prof.root)
         prof.trigger_update()
         doc.theme = BOKEH_THEME
