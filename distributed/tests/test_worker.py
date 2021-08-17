@@ -843,6 +843,34 @@ async def test_priorities(c, s, w):
     assert any(key.startswith("b1") for key in log[: len(log) // 2])
 
 
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 4)])
+async def test_root_tasks_limited(c, s, w):
+    roots = [delayed(slowinc)(i, dask_key_name=f"root-{i}") for i in range(10)]
+    deps = [delayed(inc)(r, dask_key_name=f"inc-{i}") for i, r in enumerate(roots)]
+
+    await wait(c.compute(deps))
+
+    # actual_order = [t[0] for t in w.log if t[1] == "ready" and t[2] == "executing"]
+    # order = list(dask.order.order(dask.base.collections_to_dsk(deps)))
+
+    diff_roots_in_memory = []
+    for t in w.log:
+        if len(t) != 3:
+            continue
+        key, start, stop = t
+        if key.startswith("root"):
+            if stop == "memory":
+                diff_roots_in_memory.append(1)
+            elif start == "release-key":
+                diff_roots_in_memory.append(-1)
+
+    # TODO no numpy
+    import numpy as np
+
+    roots_in_memory = np.cumsum(diff_roots_in_memory)
+    assert max(roots_in_memory) == w.nthreads
+
+
 @gen_cluster(client=True)
 async def test_heartbeats(c, s, a, b):
     x = s.workers[a.address].last_seen
