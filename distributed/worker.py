@@ -25,7 +25,14 @@ from tornado.ioloop import IOLoop, PeriodicCallback
 import dask
 from dask.core import istask
 from dask.system import CPU_COUNT
-from dask.utils import apply, format_bytes, funcname, parse_bytes, parse_timedelta
+from dask.utils import (
+    apply,
+    format_bytes,
+    funcname,
+    parse_bytes,
+    parse_timedelta,
+    stringify,
+)
 
 from . import comm, preloading, profile, system, utils
 from .batched import BatchedSend
@@ -4133,7 +4140,9 @@ def print(*args, **kwargs):
     except ValueError:
         pass
     else:
-        worker.log_event("print", {"args": args, "kwargs": kwargs})
+        msg = {"args": args, "kwargs": kwargs}
+        # https://github.com/dask/distributed/pull/5217#discussion_r690797717
+        worker.log_event("print", stringify(msg, exclusive=[]))
 
     builtins.print(*args, **kwargs)
 
