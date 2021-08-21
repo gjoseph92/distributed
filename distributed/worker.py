@@ -32,6 +32,7 @@ from dask.utils import (
     parse_bytes,
     parse_timedelta,
     stringify,
+    typename,
 )
 
 from . import comm, preloading, profile, system, utils
@@ -75,7 +76,6 @@ from .utils import (
     parse_ports,
     silence_logging,
     thread_state,
-    typename,
     warn_on_duration,
 )
 from .utils_comm import gather_from_workers, pack_data, retry_operation
@@ -1022,7 +1022,7 @@ class Worker(ServerNode):
             self.bandwidth_workers.clear()
             self.bandwidth_types.clear()
         except CommClosedError:
-            logger.warning("Heartbeat to scheduler failed")
+            logger.warning("Heartbeat to scheduler failed", exc_info=True)
             if not self.reconnect:
                 await self.close(report=False)
         except OSError as e:
