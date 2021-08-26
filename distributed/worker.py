@@ -1,5 +1,6 @@
 import asyncio
 import bisect
+import builtins
 import concurrent.futures
 import errno
 import heapq
@@ -30,13 +31,14 @@ from dask.utils import (
     funcname,
     parse_bytes,
     parse_timedelta,
+    stringify,
     typename,
 )
 
 from . import comm, preloading, profile, system, utils
 from .batched import BatchedSend
 from .comm import connect, get_address_host
-from .comm.addressing import address_from_user_args
+from .comm.addressing import address_from_user_args, parse_address
 from .comm.utils import OFFLOAD_THRESHOLD
 from .core import (
     CommClosedError,
@@ -47,7 +49,7 @@ from .core import (
     send_recv,
 )
 from .diagnostics import nvml
-from .diagnostics.plugin import _get_worker_plugin_name
+from .diagnostics.plugin import _get_plugin_name
 from .diskutils import WorkSpace
 from .http import get_handlers
 from .metrics import time
@@ -593,13 +595,16 @@ class Worker(ServerNode):
             if len(protocol_address) == 2:
                 protocol = protocol_address[0]
 
-        # Target interface on which we contact the scheduler by default
-        # TODO: it is unfortunate that we special-case inproc here
-        if not host and not interface and not scheduler_addr.startswith("inproc://"):
-            host = get_ip(get_address_host(scheduler_addr))
-
         self._start_port = port
         self._start_host = host
+        if host:
+            # Helpful error message if IPv6 specified incorrectly
+            _, host_address = parse_address(host)
+            if host_address.count(":") > 1 and not host_address.startswith("["):
+                raise ValueError(
+                    "Host address with IPv6 must be bracketed like '[::1]'; "
+                    f"got {host_address}"
+                )
         self._interface = interface
         self._protocol = protocol
 
@@ -1198,10 +1203,14 @@ class Worker(ServerNode):
                 protocol=self._protocol,
                 security=self.security,
             )
-            try:
-                await self.listen(
-                    start_address, **self.security.get_listen_args("worker")
+            kwargs = self.security.get_listen_args("worker")
+            if self._protocol in ("tcp", "tls"):
+                kwargs = kwargs.copy()
+                kwargs["default_host"] = get_ip(
+                    get_address_host(self.scheduler.address)
                 )
+            try:
+                await self.listen(start_address, **kwargs)
             except OSError as e:
                 if len(ports) > 1 and e.errno == errno.EADDRINUSE:
                     continue
@@ -2834,33 +2843,26 @@ class Worker(ServerNode):
                 plugin = pickle.loads(plugin)
 
             if name is None:
-                name = _get_worker_plugin_name(plugin)
+                name = _get_plugin_name(plugin)
 
             assert name
 
             if name in self.plugins:
-                warnings.warn(
-                    "Attempting to add a worker plugin with the same name as an already registered "
-                    f"plugin ({name}). Currently this results in no change and the previously registered "
-                    "plugin is not overwritten. This behavior is deprecated and in a future release "
-                    f"the previously registered {name} worker plugin will be overwritten.",
-                    category=FutureWarning,
-                )
-                return {"status": "repeat"}
-            else:
-                self.plugins[name] = plugin
+                await self.plugin_remove(comm=comm, name=name)
 
-                logger.info("Starting Worker plugin %s" % name)
-                if hasattr(plugin, "setup"):
-                    try:
-                        result = plugin.setup(worker=self)
-                        if isawaitable(result):
-                            result = await result
-                    except Exception as e:
-                        msg = error_message(e)
-                        return msg
+            self.plugins[name] = plugin
 
-                return {"status": "OK"}
+            logger.info("Starting Worker plugin %s" % name)
+            if hasattr(plugin, "setup"):
+                try:
+                    result = plugin.setup(worker=self)
+                    if isawaitable(result):
+                        result = await result
+                except Exception as e:
+                    msg = error_message(e)
+                    return msg
+
+            return {"status": "OK"}
 
     async def plugin_remove(self, comm=None, name=None):
         with log_errors(pdb=False):
@@ -4238,3 +4240,37 @@ else:
         return nvml.one_time()
 
     DEFAULT_STARTUP_INFORMATION["gpu"] = gpu_startup
+
+
+def print(*args, **kwargs):
+    """Dask print function
+    This prints both wherever this function is run, and also in the user's
+    client session
+    """
+    try:
+        worker = get_worker()
+    except ValueError:
+        pass
+    else:
+        msg = {
+            "args": tuple(stringify(arg) for arg in args),
+            "kwargs": {k: stringify(v) for k, v in kwargs.items()},
+        }
+        worker.log_event("print", msg)
+
+    builtins.print(*args, **kwargs)
+
+
+def warn(*args, **kwargs):
+    """Dask warn function
+    This raises a warning both wherever this function is run, and also
+    in the user's client session
+    """
+    try:
+        worker = get_worker()
+    except ValueError:
+        pass
+    else:
+        worker.log_event("warn", {"args": args, "kwargs": kwargs})
+
+    warnings.warn(*args, **kwargs)
