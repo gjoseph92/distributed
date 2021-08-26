@@ -4591,7 +4591,7 @@ class Scheduler(SchedulerState, ServerNode):
         runnables = [ts for ts in touched_tasks if ts._run_spec]
         for ts in runnables:
             if ts._priority is None and ts._run_spec:
-                ts._priority = (self.generation, 0)
+                ts._priority = (0, generation, 0)
 
         if restrictions:
             # *restrictions* is a dict keying task ids to lists of
@@ -5203,7 +5203,9 @@ class Scheduler(SchedulerState, ServerNode):
                 # logger.debug("Scheduler sends message to client %s", msg)
             except CommClosedError:
                 if self.status == Status.running:
-                    logger.critical("Tried writing to closed comm: %s", msg)
+                    logger.critical(
+                        "Closed comm %r while trying to write %s", c, msg, exc_info=True
+                    )
 
     async def add_client(self, comm, client=None, versions=None):
         """Add client to network
@@ -5504,7 +5506,9 @@ class Scheduler(SchedulerState, ServerNode):
             c.send(msg)
         except CommClosedError:
             if self.status == Status.running:
-                logger.critical("Tried writing to closed comm: %s", msg)
+                logger.critical(
+                    "Closed comm %r while trying to write %s", c, msg, exc_info=True
+                )
 
     def send_all(self, client_msgs: dict, worker_msgs: dict):
         """Send messages to client and workers"""
@@ -5520,7 +5524,12 @@ class Scheduler(SchedulerState, ServerNode):
                 c.send(*msgs)
             except CommClosedError:
                 if self.status == Status.running:
-                    logger.critical("Tried writing to closed comm: %s", msgs)
+                    logger.critical(
+                        "Closed comm %r while trying to write %s",
+                        c,
+                        msgs,
+                        exc_info=True,
+                    )
 
         for worker, msgs in worker_msgs.items():
             try:
