@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import importlib
 import traceback
 from array import array
@@ -13,7 +15,13 @@ from dask.utils import typename
 from ..utils import ensure_bytes, has_keyword
 from . import pickle
 from .compression import decompress, maybe_compress
-from .utils import frame_split_size, msgpack_opts, pack_frames_prelude, unpack_frames
+from .utils import (
+    frame_split_size,
+    merge_memoryviews,
+    msgpack_opts,
+    pack_frames_prelude,
+    unpack_frames,
+)
 
 lazy_registrations = {}
 
@@ -462,15 +470,18 @@ def merge_and_deserialize(header, frames, deserializers=None):
     deserialize
     serialize_and_split
     """
-    merged_frames = []
     if "split-num-sub-frames" not in header:
         merged_frames = frames
     else:
+        merged_frames = []
         for n, offset in zip(header["split-num-sub-frames"], header["split-offsets"]):
-            if n == 1:
-                merged_frames.append(frames[offset])
-            else:
-                merged_frames.append(bytearray().join(frames[offset : offset + n]))
+            subframes = frames[offset : offset + n]
+            try:
+                merged = merge_memoryviews(subframes)
+            except (ValueError, TypeError):
+                merged = bytearray().join(subframes)
+
+            merged_frames.append(merged)
 
     return deserialize(header, merged_frames, deserializers=deserializers)
 
