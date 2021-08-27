@@ -369,12 +369,13 @@ def _expect_tls_context(connection_args):
 
 class RequireEncryptionMixin:
     def _check_encryption(self, address, connection_args):
-        if not self.encrypted and connection_args.get("require_encryption"):
-            # XXX Should we have a dedicated SecurityError class?
-            raise RuntimeError(
-                "encryption required by Dask configuration, "
-                "refusing communication from/to %r" % (self.prefix + address,)
-            )
+        pass
+        # if not self.encrypted and connection_args.get("require_encryption"):
+        #     # XXX Should we have a dedicated SecurityError class?
+        #     raise RuntimeError(
+        #         "encryption required by Dask configuration, "
+        #         "refusing communication from/to %r" % (self.prefix + address,)
+        #     )
 
 
 class BaseTCPConnector(Connector, RequireEncryptionMixin):
