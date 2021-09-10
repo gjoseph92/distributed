@@ -42,6 +42,7 @@ from dask.widgets import get_template
 
 from . import preloading, profile
 from . import versions as version_module
+from .active_memory_manager import ActiveMemoryManagerExtension
 from .batched import BatchedSend
 from .comm import (
     get_address_host,
@@ -172,6 +173,7 @@ DEFAULT_EXTENSIONS = [
     PubSubSchedulerExtension,
     SemaphoreExtension,
     EventExtension,
+    ActiveMemoryManagerExtension,
 ]
 
 ALL_TASK_STATES = declare(
@@ -2181,7 +2183,7 @@ class SchedulerState:
                 self._transition_counter += 1
                 recommendations, client_msgs, worker_msgs = a
             elif "released" not in start_finish:
-                assert not args and not kwargs, (args, kwargs)
+                assert not args and not kwargs, (args, kwargs, start_finish)
                 a_recs: dict
                 a_cmsgs: dict
                 a_wmsgs: dict
@@ -4716,7 +4718,7 @@ class Scheduler(SchedulerState, ServerNode):
                     "reason": f"already-released-or-forgotten-{time()}",
                 }
             ]
-        elif ts.state == "memory":
+        elif ts._state == "memory":
             self.add_keys(worker=worker, keys=[key])
         else:
             ts._metadata.update(kwargs["metadata"])
@@ -5346,8 +5348,8 @@ class Scheduler(SchedulerState, ServerNode):
         ts: TaskState = parent._tasks.get(key)
         if ts is None:
             return
-        ws: WorkerState = parent._workers_dv[worker]
-        if ts._processing_on != ws:
+        ws: WorkerState = parent._workers_dv.get(worker)
+        if ws is None or ts._processing_on != ws:
             return
 
         recommendations: dict
@@ -5381,7 +5383,9 @@ class Scheduler(SchedulerState, ServerNode):
 
     def release_worker_data(self, comm=None, keys=None, worker=None):
         parent: SchedulerState = cast(SchedulerState, self)
-        ws: WorkerState = parent._workers_dv[worker]
+        ws: WorkerState = parent._workers_dv.get(worker)
+        if not ws:
+            return
         tasks: set = {parent._tasks[k] for k in keys if k in parent._tasks}
         removed_tasks: set = tasks.intersection(ws._has_what)
 
@@ -5600,6 +5604,9 @@ class Scheduler(SchedulerState, ServerNode):
             try:
                 w = stream_comms[worker]
                 w.send(*msgs)
+            except KeyError:
+                # worker already gone
+                pass
             except (CommClosedError, AttributeError):
                 self.loop.add_callback(self.remove_worker, address=worker)
 
@@ -5862,8 +5869,8 @@ class Scheduler(SchedulerState, ServerNode):
         )
         return d[worker]
 
-    async def _gather_on_worker(
-        self, worker_address: str, who_has: "dict[Hashable, list[str]]"
+    async def gather_on_worker(
+        self, worker_address: str, who_has: "dict[str, list[str]]"
     ) -> set:
         """Peer-to-peer copy of keys from multiple workers to a single worker
 
@@ -5922,7 +5929,7 @@ class Scheduler(SchedulerState, ServerNode):
 
         return keys_failed
 
-    async def _delete_worker_data(self, worker_address: str, keys: "list[str]") -> None:
+    async def delete_worker_data(self, worker_address: str, keys: "list[str]") -> None:
         """Delete data from a worker and update the corresponding worker/task states
 
         Parameters
@@ -6293,7 +6300,7 @@ class Scheduler(SchedulerState, ServerNode):
                 await asyncio.gather(
                     *(
                         # Note: this never raises exceptions
-                        self._gather_on_worker(w, who_has)
+                        self.gather_on_worker(w, who_has)
                         for w, who_has in to_recipients.items()
                     )
                 ),
@@ -6307,7 +6314,7 @@ class Scheduler(SchedulerState, ServerNode):
 
         # Note: this never raises exceptions
         await asyncio.gather(
-            *(self._delete_worker_data(r, v) for r, v in to_senders.items())
+            *(self.delete_worker_data(r, v) for r, v in to_senders.items())
         )
 
         for r, v in to_recipients.items():
@@ -6393,7 +6400,7 @@ class Scheduler(SchedulerState, ServerNode):
                 # Note: this never raises exceptions
                 await asyncio.gather(
                     *[
-                        self._delete_worker_data(ws._address, [t.key for t in tasks])
+                        self.delete_worker_data(ws._address, [t.key for t in tasks])
                         for ws, tasks in del_worker_tasks.items()
                     ]
                 )
@@ -6423,7 +6430,7 @@ class Scheduler(SchedulerState, ServerNode):
                 await asyncio.gather(
                     *(
                         # Note: this never raises exceptions
-                        self._gather_on_worker(w, who_has)
+                        self.gather_on_worker(w, who_has)
                         for w, who_has in gathers.items()
                     )
                 )
@@ -7040,7 +7047,7 @@ class Scheduler(SchedulerState, ServerNode):
             )
 
         plugin = plugins[0]
-        self.remove_plugin(plugin)
+        self.remove_plugin(name=plugin.name)
         return {"metadata": plugin.metadata, "state": plugin.state}
 
     async def register_worker_plugin(self, comm, plugin, name=None):
@@ -7885,6 +7892,7 @@ def _task_to_msg(state: SchedulerState, ts: TaskState, duration: double = -1) ->
 
     if ts._annotations:
         msg["annotations"] = ts._annotations
+
     return msg
 
 
@@ -8172,6 +8180,8 @@ class WorkerStatusPlugin(SchedulerPlugin):
     scheduler.
     """
 
+    name = "worker-status"
+
     def __init__(self, scheduler, comm):
         self.bcomm = BatchedSend(interval="5ms")
         self.bcomm.start(comm)
@@ -8186,13 +8196,13 @@ class WorkerStatusPlugin(SchedulerPlugin):
         try:
             self.bcomm.send(["add", {"workers": {worker: ident}}])
         except CommClosedError:
-            self.scheduler.remove_plugin(self)
+            self.scheduler.remove_plugin(name=self.name)
 
     def remove_worker(self, worker=None, **kwargs):
         try:
             self.bcomm.send(["remove", worker])
         except CommClosedError:
-            self.scheduler.remove_plugin(self)
+            self.scheduler.remove_plugin(name=self.name)
 
     def teardown(self):
         self.bcomm.close()

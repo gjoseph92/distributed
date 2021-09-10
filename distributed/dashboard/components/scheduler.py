@@ -1943,6 +1943,7 @@ class TaskGraph(DashboardComponent):
     def __init__(self, scheduler, **kwargs):
         self.scheduler = scheduler
         self.layout = GraphLayout(scheduler)
+        scheduler.add_plugin(self.layout)
         self.invisible_count = 0  # number of invisible nodes
 
         self.node_source = ColumnDataSource(
@@ -2113,7 +2114,7 @@ class TaskGraph(DashboardComponent):
             self.edge_source.patch({"visible": updates})
 
     def __del__(self):
-        self.scheduler.remove_plugin(self.layout)
+        self.scheduler.remove_plugin(name=self.layout.name)
 
 
 class TaskGroupGraph(DashboardComponent):
