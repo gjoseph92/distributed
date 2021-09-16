@@ -1,4 +1,5 @@
 import asyncio
+import bisect
 import heapq
 import inspect
 import itertools
@@ -516,6 +517,7 @@ class WorkerState:
         "_occupancy",
         "_pid",
         "_processing",
+        "_priorities",
         "_resources",
         "_services",
         "_status",
@@ -563,6 +565,7 @@ class WorkerState:
         self._actors = set()
         self._has_what = {}
         self._processing = {}
+        self._priorities = []
         self._executing = {}
         self._resources = {}
         self._used_resources = {}
@@ -671,6 +674,10 @@ class WorkerState:
     @property
     def processing(self):
         return self._processing
+
+    @property
+    def priorities(self):
+        return self._priorities
 
     @property
     def resources(self):
@@ -2595,6 +2602,7 @@ class SchedulerState:
 
             duration_estimate = self.set_duration_estimate(ts, ws)
             ts._processing_on = ws
+            bisect.insort(ws._priorities, ts._priority)
             ws._occupancy += duration_estimate
             self._total_occupancy += duration_estimate
             ts.state = "processing"
@@ -3417,7 +3425,10 @@ class SchedulerState:
                 nbytes = dts.get_nbytes()
                 comm_bytes += nbytes
 
-        stack_time: double = ws._occupancy / ws._nthreads
+        i = bisect.bisect(ws._priorities, ts._priority)
+        stack_time: double = (ws._occupancy / ws._nthreads) * (
+            i / (len(ws._priorities) or 1)
+        )
         start_time: double = stack_time + comm_bytes / self._bandwidth
 
         if ts._actor:
@@ -7704,6 +7715,10 @@ def _remove_from_processing(state: SchedulerState, ts: TaskState) -> str:
 
     if w not in state._workers_dv:  # may have been removed
         return None
+
+    i = bisect.bisect_left(ws._priorities, ts._priority)
+    assert ws._priorities[i] is ts._priority
+    del ws._priorities[i]
 
     duration: double = ws._processing.pop(ts)
     if not ws._processing:
