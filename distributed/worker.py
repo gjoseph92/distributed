@@ -3508,7 +3508,7 @@ class Worker(ServerNode):
         if not self._client:
             from .client import Client
 
-            asynchronous = self.loop is IOLoop.current()
+            asynchronous = self.loop is IOLoop.current(instance=False)
             self._client = Client(
                 self.scheduler,
                 loop=self.loop,
