@@ -350,10 +350,9 @@ class LoopRunner:
     _lock = threading.Lock()
 
     def __init__(self, loop=None, asynchronous=False):
-        current = IOLoop.current()
         if loop is None:
             if asynchronous:
-                self._loop = current
+                self._loop = IOLoop.current()
             else:
                 # We're expecting the loop to run in another thread,
                 # avoid re-using this thread's assigned loop
@@ -1033,49 +1032,6 @@ def reset_logger_locks():
     for name in logging.Logger.manager.loggerDict.keys():
         for handler in logging.getLogger(name).handlers:
             handler.createLock()
-
-
-is_server_extension = False
-
-if "notebook" in sys.modules:
-    import traitlets
-    from notebook.notebookapp import NotebookApp
-
-    is_server_extension = traitlets.config.Application.initialized() and isinstance(
-        traitlets.config.Application.instance(), NotebookApp
-    )
-
-if not is_server_extension:
-    is_kernel_and_no_running_loop = False
-
-    if is_kernel():
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            is_kernel_and_no_running_loop = True
-
-    if not is_kernel_and_no_running_loop:
-
-        # TODO: Use tornado's AnyThreadEventLoopPolicy, instead of class below,
-        # once tornado > 6.0.3 is available.
-        if WINDOWS and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
-            # WindowsProactorEventLoopPolicy is not compatible with tornado 6
-            # fallback to the pre-3.8 default of Selector
-            # https://github.com/tornadoweb/tornado/issues/2608
-            BaseEventLoopPolicy = asyncio.WindowsSelectorEventLoopPolicy
-        else:
-            BaseEventLoopPolicy = asyncio.DefaultEventLoopPolicy
-
-        class AnyThreadEventLoopPolicy(BaseEventLoopPolicy):
-            def get_event_loop(self):
-                try:
-                    return super().get_event_loop()
-                except (RuntimeError, AssertionError):
-                    loop = self.new_event_loop()
-                    self.set_event_loop(loop)
-                    return loop
-
-        asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
 
 
 @functools.lru_cache(1000)
