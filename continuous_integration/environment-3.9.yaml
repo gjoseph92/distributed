@@ -49,7 +49,7 @@ dependencies:
   - zict  # overridden by git tip below
   - zstandard
   - pip:
-      - git+https://github.com/dask/dask
+      - git+https://github.com/gjoseph92/dask@p2p-shuffle-draft
       - git+https://github.com/dask/s3fs
       - git+https://github.com/dask/zict
       # FIXME https://github.com/dask/distributed/issues/5345
