@@ -42,5 +42,5 @@ dependencies:
   - zict
   - zstandard
   - pip:
-      - git+https://github.com/dask/dask
+      - git+https://github.com/gjoseph92/dask@p2p-shuffle-draft
       - keras
