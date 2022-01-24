@@ -1,20 +1,17 @@
-from __future__ import print_function, division, absolute_import
-
-import atexit
-from datetime import timedelta
+import asyncio
 import logging
 import os
 import re
 import threading
 import weakref
+from queue import Queue as PyQueue
 
-from .compatibility import finalize, Queue as PyQueue
-from .utils import mp_context
-
-from tornado import gen
 from tornado.concurrent import Future
 from tornado.ioloop import IOLoop
 
+import dask
+
+from .utils import TimeoutError, mp_context
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +38,13 @@ def _call_and_set_future(loop, future, func, *args, **kwargs):
         _loop_add_callback(loop, future.set_result, res)
 
 
-class _ProcessState(object):
+class _ProcessState:
     is_alive = False
     pid = None
     exitcode = None
 
 
-class AsyncProcess(object):
+class AsyncProcess:
     """
     A coroutine-compatible multiprocessing.Process-alike.
     All normally blocking methods are wrapped in Tornado coroutines.
@@ -55,7 +52,7 @@ class AsyncProcess(object):
 
     def __init__(self, loop=None, target=None, name=None, args=(), kwargs={}):
         if not callable(target):
-            raise TypeError("`target` needs to be callable, not %r" % (type(target),))
+            raise TypeError(f"`target` needs to be callable, not {type(target)!r}")
         self._state = _ProcessState()
         self._loop = loop or IOLoop.current(instance=False)
 
@@ -73,10 +70,19 @@ class AsyncProcess(object):
         self._process = mp_context.Process(
             target=self._run,
             name=name,
-            args=(target, args, kwargs, parent_alive_pipe, self._keep_child_alive),
+            args=(
+                target,
+                args,
+                kwargs,
+                parent_alive_pipe,
+                self._keep_child_alive,
+                dask.config.global_config,
+            ),
         )
-        _dangling.add(self._process)
         self._name = self._process.name
+        self._proc_finalizer = weakref.finalize(
+            self, _asyncprocess_finalizer, self._process
+        )
         self._watch_q = PyQueue()
         self._exit_future = Future()
         self._exit_callback = None
@@ -85,7 +91,7 @@ class AsyncProcess(object):
         self._start_threads()
 
     def __repr__(self):
-        return "<%s %s>" % (self.__class__.__name__, self._name)
+        return f"<{self.__class__.__name__} {self._name}>"
 
     def _check_closed(self):
         if self._closed:
@@ -112,8 +118,8 @@ class AsyncProcess(object):
             # We don't join the thread here as a finalizer can be called
             # asynchronously from anywhere
 
-        self._finalizer = finalize(self, stop_thread, q=self._watch_q)
-        self._finalizer.atexit = False
+        self._thread_finalizer = weakref.finalize(self, stop_thread, q=self._watch_q)
+        self._thread_finalizer.atexit = False
 
     def _on_exit(self, exitcode):
         # Called from the event loop when the child process exited
@@ -154,30 +160,18 @@ class AsyncProcess(object):
         t.daemon = True
         t.start()
 
-    @staticmethod
-    def reset_logger_locks():
-        """ Python 2's logger's locks don't survive a fork event
-
-        https://github.com/dask/distributed/issues/1491
-        """
-        for name in logging.Logger.manager.loggerDict.keys():
-            for handler in logging.getLogger(name).handlers:
-                handler.createLock()
-
     @classmethod
-    def _run(cls, target, args, kwargs, parent_alive_pipe, _keep_child_alive):
-        # On Python 2 with the fork method, we inherit the _keep_child_alive fd,
-        # whether it is passed or not. Therefore, pass it unconditionally and
-        # close it here, so that there are no other references to the pipe lying
-        # around.
-        cls.reset_logger_locks()
-
+    def _run(
+        cls, target, args, kwargs, parent_alive_pipe, _keep_child_alive, inherit_config
+    ):
         _keep_child_alive.close()
 
         # Child process entry point
         cls._immediate_exit_when_closed(parent_alive_pipe)
 
         threading.current_thread().name = "MainThread"
+        # Update the global config given priority to the existing global config
+        dask.config.update(dask.config.global_config, inherit_config, priority="old")
         target(*args, **kwargs)
 
     @classmethod
@@ -201,11 +195,11 @@ class AsyncProcess(object):
 
             state.is_alive = True
             state.pid = process.pid
-            logger.debug("[%s] created process with pid %r" % (r, state.pid))
+            logger.debug(f"[{r}] created process with pid {state.pid!r}")
 
         while True:
             msg = q.get()
-            logger.debug("[%s] got message %r" % (r, msg))
+            logger.debug(f"[{r}] got message {msg!r}")
             op = msg["op"]
             if op == "start":
                 _call_and_set_future(loop, msg["future"], _start)
@@ -239,7 +233,7 @@ class AsyncProcess(object):
         """
         Start the child process.
 
-        This method is a coroutine.
+        This method returns a future.
         """
         self._check_closed()
         fut = Future()
@@ -250,30 +244,31 @@ class AsyncProcess(object):
         """
         Terminate the child process.
 
-        This method is a coroutine.
+        This method returns a future.
         """
         self._check_closed()
         fut = Future()
         self._watch_q.put_nowait({"op": "terminate", "future": fut})
         return fut
 
-    @gen.coroutine
-    def join(self, timeout=None):
+    async def join(self, timeout=None):
         """
         Wait for the child process to exit.
 
-        This method is a coroutine.
+        This method returns a coroutine.
         """
         self._check_closed()
         assert self._state.pid is not None, "can only join a started process"
         if self._state.exitcode is not None:
             return
         if timeout is None:
-            yield self._exit_future
+            await self._exit_future
         else:
             try:
-                yield gen.with_timeout(timedelta(seconds=timeout), self._exit_future)
-            except gen.TimeoutError:
+                # Shield otherwise the timeout cancels the future and our
+                # on_exit callback will try to set a result on a canceled future
+                await asyncio.wait_for(asyncio.shield(self._exit_future), timeout)
+            except TimeoutError:
                 pass
 
     def close(self):
@@ -282,7 +277,7 @@ class AsyncProcess(object):
         immediately and does not ensure the child process has exited.
         """
         if not self._closed:
-            self._finalizer()
+            self._thread_finalizer()
             self._process = None
             self._closed = True
 
@@ -324,15 +319,10 @@ class AsyncProcess(object):
         self._process.daemon = value
 
 
-_dangling = weakref.WeakSet()
-
-
-@atexit.register
-def _cleanup_dangling():
-    for proc in list(_dangling):
-        if proc.is_alive():
-            try:
-                logger.warning("reaping stray process %s" % (proc,))
-                proc.terminate()
-            except OSError:
-                pass
+def _asyncprocess_finalizer(proc):
+    if proc.is_alive():
+        try:
+            logger.info(f"reaping stray process {proc}")
+            proc.terminate()
+        except OSError:
+            pass

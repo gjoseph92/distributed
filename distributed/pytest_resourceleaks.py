@@ -1,17 +1,16 @@
-# -*- coding: utf-8 -*-
 """
 A pytest plugin to trace resource leaks.
 """
-from __future__ import print_function, division
-
 import collections
 import gc
-import time
 import os
 import sys
 import threading
+from time import sleep
 
 import pytest
+
+from .metrics import time
 
 
 def pytest_addoption(parser):
@@ -32,7 +31,7 @@ Can be 'all' or a comma-separated list of resource names
     group.addoption(
         "--leaks-timeout",
         action="store",
-        type="float",
+        type=float,
         dest="leaks_timeout",
         default=0.5,
         help="""\
@@ -69,7 +68,7 @@ def pytest_configure(config):
             leaks = leaks.split(",")
         unknown = sorted(set(leaks) - set(all_checkers))
         if unknown:
-            raise ValueError("unknown resources: %r" % (unknown,))
+            raise ValueError(f"unknown resources: {unknown!r}")
 
         checkers = [all_checkers[leak]() for leak in leaks]
         checker = LeakChecker(
@@ -94,7 +93,7 @@ def register_checker(name):
     return decorate
 
 
-class ResourceChecker(object):
+class ResourceChecker:
     def on_start_test(self):
         pass
 
@@ -262,7 +261,7 @@ class TracemallocMemoryChecker(ResourceChecker):
         return "\n".join(lines)
 
 
-class LeakChecker(object):
+class LeakChecker:
     def __init__(self, checkers, grace_delay, mark_failed, max_retries):
         self.checkers = checkers
         self.grace_delay = grace_delay
@@ -316,7 +315,7 @@ class LeakChecker(object):
                     leaks.append((checker, before, after))
             return leaks
 
-        t1 = time.time()
+        t1 = time()
         deadline = t1 + self.grace_delay
         leaks = run_measurements()
         if leaks:
@@ -325,8 +324,8 @@ class LeakChecker(object):
                 c.on_retry()
             leaks = run_measurements()
 
-        while leaks and time.time() < deadline:
-            time.sleep(0.1)
+        while leaks and time() < deadline:
+            sleep(0.1)
             self.cleanup()
             for c, _, _ in leaks:
                 c.on_retry()
@@ -347,7 +346,7 @@ class LeakChecker(object):
             from _pytest.runner import runtestprotocol
 
             item._initrequest()  # Re-init fixtures
-            reports = runtestprotocol(item, nextitem=nextitem, log=False)
+            runtestprotocol(item, nextitem=nextitem, log=False)
 
         nodeid = item.nodeid
         leaks = self.leaks.get(nodeid)
@@ -356,7 +355,7 @@ class LeakChecker(object):
             try:
                 for i in range(self.max_retries):
                     run_test_again()
-            except Exception as e:
+            except Exception:
                 print("--- Exception when re-running test ---")
                 import traceback
 
@@ -391,7 +390,7 @@ class LeakChecker(object):
                 unknown = sorted(set(leaking.args) - set(all_checkers))
                 if unknown:
                     raise ValueError(
-                        "pytest.mark.leaking: unknown resources %r" % (unknown,)
+                        f"pytest.mark.leaking: unknown resources {unknown!r}"
                     )
                 classes = tuple(all_checkers[a] for a in leaking.args)
                 self.skip_checkers[nodeid] = {
@@ -430,7 +429,7 @@ class LeakChecker(object):
                         report.outcome = "failed"
                         report.longrepr = "\n".join(
                             [
-                                "%s %s" % (nodeid, checker.format(before, after))
+                                f"{nodeid} {checker.format(before, after)}"
                                 for checker, before, after in leaks
                             ]
                         )
@@ -449,4 +448,4 @@ class LeakChecker(object):
             for rep in leaked:
                 nodeid = rep.nodeid
                 for checker, before, after in self.leaks[nodeid]:
-                    tr.line("%s %s" % (rep.nodeid, checker.format(before, after)))
+                    tr.line(f"{rep.nodeid} {checker.format(before, after)}")

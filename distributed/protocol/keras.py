@@ -1,8 +1,6 @@
-from __future__ import print_function, division, absolute_import
-
-from .serialize import dask_serialize, dask_deserialize, serialize, deserialize
-
 import keras
+
+from .serialize import dask_deserialize, dask_serialize, deserialize, serialize
 
 
 @dask_serialize.register(keras.Model)
@@ -11,7 +9,7 @@ def serialize_keras_model(model):
 
     if keras.__version__ < "1.2.0":
         raise ImportError(
-            "Need Keras >= 1.2.0. " "Try pip install keras --upgrade --no-deps"
+            "Need Keras >= 1.2.0. Try python -m pip install keras --upgrade --no-deps"
         )
 
     header = model._updated_config()

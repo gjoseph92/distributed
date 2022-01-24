@@ -45,12 +45,14 @@ One can also pass additional parameters:
 * a set of allowed *ciphers*, if you have strong requirements as to which
   algorithms are considered secure;  this setting's value should be an
   `OpenSSL cipher string <https://www.openssl.org/docs/man1.1.0/apps/ciphers.html>`_;
+* a *minimum* and/or *maximum* TLS version to support. For security reasons,
+  distributed only supports TLS versions >= 1.2.
 * whether to *require encryption*, to avoid using plain TCP communications
   by mistake.
 
 All those parameters can be passed in several ways:
 
-* through the Dask :ref:`configuration file <configuration>`;
+* through the Dask :doc:`configuration file <configuration>`;
 * if using the command line, through options to ``dask-scheduler`` and
   ``dask-worker``;
 * if using the API, through a ``Security`` object.  For example, here is
@@ -96,3 +98,12 @@ very large data over very high speed network links.
    `A study of AES-NI acceleration <https://calomel.org/aesni_ssl_performance.html>`_
    shows recent x86 CPUs can AES-encrypt more than 1 GB per second
    on each CPU core.
+
+
+API
+---
+
+.. currentmodule:: distributed
+
+.. autoclass:: distributed.security.Security
+   :members:

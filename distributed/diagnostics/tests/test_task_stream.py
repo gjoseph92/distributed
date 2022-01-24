@@ -1,27 +1,25 @@
-from __future__ import absolute_import, division, print_function
-
 import os
 from time import sleep
 
 import pytest
-from toolz import frequencies
+from tlz import frequencies
 
 from distributed import get_task_stream
-from distributed.utils_test import gen_cluster, div, inc, slowinc
-from distributed.utils_test import client, loop, cluster_fixture  # noqa: F401
 from distributed.client import wait
 from distributed.diagnostics.task_stream import TaskStreamPlugin
 from distributed.metrics import time
+from distributed.utils_test import div, gen_cluster, inc, slowinc
 
 
 @gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 3)
-def test_TaskStreamPlugin(c, s, *workers):
+async def test_TaskStreamPlugin(c, s, *workers):
     es = TaskStreamPlugin(s)
+    s.add_plugin(es)
     assert not es.buffer
 
     futures = c.map(div, [1] * 10, range(10))
     total = c.submit(sum, futures[1:])
-    yield wait(total)
+    await wait(total)
 
     assert len(es.buffer) == 11
 
@@ -47,19 +45,21 @@ def test_TaskStreamPlugin(c, s, *workers):
 
 
 @gen_cluster(client=True)
-def test_maxlen(c, s, a, b):
+async def test_maxlen(c, s, a, b):
     tasks = TaskStreamPlugin(s, maxlen=5)
+    s.add_plugin(tasks)
     futures = c.map(inc, range(10))
-    yield wait(futures)
+    await wait(futures)
     assert len(tasks.buffer) == 5
 
 
 @gen_cluster(client=True)
-def test_collect(c, s, a, b):
+async def test_collect(c, s, a, b):
     tasks = TaskStreamPlugin(s)
+    s.add_plugin(tasks)
     start = time()
     futures = c.map(slowinc, range(10), delay=0.1)
-    yield wait(futures)
+    await wait(futures)
 
     L = tasks.collect()
     assert len(L) == len(futures)
@@ -84,15 +84,38 @@ def test_collect(c, s, a, b):
 
 
 @gen_cluster(client=True)
-def test_client(c, s, a, b):
-    L = yield c.get_task_stream()
+async def test_no_startstops(c, s, a, b):
+    tasks = TaskStreamPlugin(s)
+    s.add_plugin(tasks)
+    # just to create the key on the scheduler
+    future = c.submit(inc, 1)
+    await wait(future)
+    assert len(tasks.buffer) == 1
+
+    tasks.transition(future.key, "processing", "erred")
+    # Transition was not recorded because it didn't contain `startstops`
+    assert len(tasks.buffer) == 1
+
+    tasks.transition(future.key, "processing", "erred", startstops=[])
+    # Transition was not recorded because `startstops` was empty
+    assert len(tasks.buffer) == 1
+
+    tasks.transition(
+        future.key, "processing", "erred", startstops=[dict(start=time(), stop=time())]
+    )
+    assert len(tasks.buffer) == 2
+
+
+@gen_cluster(client=True)
+async def test_client(c, s, a, b):
+    L = await c.get_task_stream()
     assert L == ()
 
     futures = c.map(slowinc, range(10), delay=0.1)
-    yield wait(futures)
+    await wait(futures)
 
-    tasks = [p for p in s.plugins if isinstance(p, TaskStreamPlugin)][0]
-    L = yield c.get_task_stream()
+    tasks = s.plugins[TaskStreamPlugin.name]
+    L = await c.get_task_stream()
     assert L == tuple(tasks.buffer)
 
 
@@ -107,14 +130,14 @@ def test_client_sync(client):
 
 
 @gen_cluster(client=True)
-def test_get_task_stream_plot(c, s, a, b):
+async def test_get_task_stream_plot(c, s, a, b):
     bokeh = pytest.importorskip("bokeh")
-    yield c.get_task_stream()
+    await c.get_task_stream()
 
     futures = c.map(slowinc, range(10), delay=0.1)
-    yield wait(futures)
+    await wait(futures)
 
-    data, figure = yield c.get_task_stream(plot=True)
+    data, figure = await c.get_task_stream(plot=True)
     assert isinstance(figure, bokeh.plotting.Figure)
 
 

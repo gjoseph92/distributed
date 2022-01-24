@@ -1,5 +1,3 @@
-from __future__ import print_function, division, absolute_import
-
 import pytest
 
 pytest.importorskip("ipywidgets")
@@ -73,41 +71,40 @@ def record_display(*args):
 # Distributed stuff #
 #####################
 
-from operator import add
 import re
+from operator import add
 
-from toolz import valmap
+from tlz import valmap
 
 from distributed.client import wait
-from distributed.worker import dumps_task
-from distributed.utils_test import inc, dec, throws, gen_cluster, gen_tls_cluster
-from distributed.utils_test import client, loop, cluster_fixture  # noqa: F401
 from distributed.diagnostics.progressbar import (
-    ProgressWidget,
     MultiProgressWidget,
+    ProgressWidget,
     progress,
 )
+from distributed.utils_test import dec, gen_cluster, gen_tls_cluster, inc, throws
+from distributed.worker import dumps_task
 
 
 @gen_cluster(client=True)
-def test_progressbar_widget(c, s, a, b):
+async def test_progressbar_widget(c, s, a, b):
     x = c.submit(inc, 1)
     y = c.submit(inc, x)
     z = c.submit(inc, y)
-    yield wait(z)
+    await wait(z)
 
     progress = ProgressWidget([z.key], scheduler=s.address, complete=True)
-    yield progress.listen()
+    await progress.listen()
 
     assert progress.bar.value == 1.0
     assert "3 / 3" in progress.bar_text.value
 
     progress = ProgressWidget([z.key], scheduler=s.address)
-    yield progress.listen()
+    await progress.listen()
 
 
 @gen_cluster(client=True)
-def test_multi_progressbar_widget(c, s, a, b):
+async def test_multi_progressbar_widget(c, s, a, b):
     x1 = c.submit(inc, 1)
     x2 = c.submit(inc, x1)
     x3 = c.submit(inc, x2)
@@ -115,10 +112,10 @@ def test_multi_progressbar_widget(c, s, a, b):
     y2 = c.submit(dec, y1)
     e = c.submit(throws, y2)
     other = c.submit(inc, 123)
-    yield wait([other, e])
+    await wait([other, e])
 
     p = MultiProgressWidget([e.key], scheduler=s.address, complete=True)
-    yield p.listen()
+    await p.listen()
 
     assert p.bars["inc"].value == 1.0
     assert p.bars["dec"].value == 1.0
@@ -147,7 +144,7 @@ def test_multi_progressbar_widget(c, s, a, b):
 
 
 @gen_cluster()
-def test_multi_progressbar_widget_after_close(s, a, b):
+async def test_multi_progressbar_widget_after_close(s, a, b):
     s.update_graph(
         tasks=valmap(
             dumps_task,
@@ -172,7 +169,7 @@ def test_multi_progressbar_widget_after_close(s, a, b):
     )
 
     p = MultiProgressWidget(["x-1", "x-2", "x-3"], scheduler=s.address)
-    yield p.listen()
+    await p.listen()
 
     assert "x" in p.bars
 
@@ -233,7 +230,7 @@ def test_progressbar_cancel(client):
 
 
 @gen_cluster()
-def test_multibar_complete(s, a, b):
+async def test_multibar_complete(s, a, b):
     s.update_graph(
         tasks=valmap(
             dumps_task,
@@ -258,7 +255,7 @@ def test_multibar_complete(s, a, b):
     )
 
     p = MultiProgressWidget(["e"], scheduler=s.address, complete=True)
-    yield p.listen()
+    await p.listen()
 
     assert p._last_response["all"] == {"x": 3, "y": 2, "e": 1}
     assert all(b.value == 1.0 for k, b in p.bars.items() if k != "e")
@@ -276,28 +273,28 @@ def test_fast(client):
 
 
 @gen_cluster(client=True, client_kwargs={"serializers": ["msgpack"]})
-def test_serializers(c, s, a, b):
+async def test_serializers(c, s, a, b):
     x = c.submit(inc, 1)
     y = c.submit(inc, x)
     z = c.submit(inc, y)
-    yield wait(z)
+    await wait(z)
 
     progress = ProgressWidget([z], scheduler=s.address, complete=True)
-    yield progress.listen()
+    await progress.listen()
 
     assert progress.bar.value == 1.0
     assert "3 / 3" in progress.bar_text.value
 
 
 @gen_tls_cluster(client=True)
-def test_tls(c, s, a, b):
+async def test_tls(c, s, a, b):
     x = c.submit(inc, 1)
     y = c.submit(inc, x)
     z = c.submit(inc, y)
-    yield wait(z)
+    await wait(z)
 
     progress = ProgressWidget([z], scheduler=s.address, complete=True)
-    yield progress.listen()
+    await progress.listen()
 
     assert progress.bar.value == 1.0
     assert "3 / 3" in progress.bar_text.value

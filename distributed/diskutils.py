@@ -1,18 +1,17 @@
-from __future__ import print_function, division, absolute_import
+from __future__ import annotations
 
-import errno
 import glob
 import logging
 import os
 import shutil
 import stat
 import tempfile
+import weakref
+from typing import ClassVar
 
 import dask
 
 from . import locket
-from .compatibility import finalize
-
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +25,21 @@ def is_locking_enabled():
 def safe_unlink(path):
     try:
         os.unlink(path)
-    except EnvironmentError as e:
+    except FileNotFoundError:
         # Perhaps it was removed by someone else?
-        if e.errno != errno.ENOENT:
-            logger.error("Failed to remove %r", str(e))
+        pass
+    except OSError as e:
+        logger.error(f"Failed to remove {path}: {e}")
 
 
-class WorkDir(object):
+class WorkDir:
     """
     A temporary work directory inside a WorkSpace.
     """
+
+    dir_path: str
+    _lock_path: str
+    _finalizer: weakref.finalize
 
     def __init__(self, workspace, name=None, prefix=None):
         assert name is None or prefix is None
@@ -57,7 +61,7 @@ class WorkDir(object):
                     with workspace._global_lock():
                         self._lock_file = locket.lock_file(self._lock_path)
                         self._lock_file.acquire()
-                except OSError as e:
+                except OSError:
                     logger.exception(
                         "Could not acquire workspace lock on "
                         "path: %s ."
@@ -73,7 +77,7 @@ class WorkDir(object):
                 raise
             workspace._known_locks.add(self._lock_path)
 
-            self._finalizer = finalize(
+            self._finalizer = weakref.finalize(
                 self,
                 self._finalize,
                 workspace,
@@ -82,7 +86,7 @@ class WorkDir(object):
                 self.dir_path,
             )
         else:
-            self._finalizer = finalize(
+            self._finalizer = weakref.finalize(
                 self, self._finalize, workspace, None, None, self.dir_path
             )
 
@@ -104,7 +108,7 @@ class WorkDir(object):
                 safe_unlink(lock_path)
 
 
-class WorkSpace(object):
+class WorkSpace:
     """
     An on-disk workspace that tracks disposable work directories inside it.
     If a process crashes or another event left stale directories behind,
@@ -113,7 +117,7 @@ class WorkSpace(object):
 
     # Keep track of all locks known to this process, to avoid several
     # WorkSpaces to step on each other's toes
-    _known_locks = set()
+    _known_locks: ClassVar[set[str]] = set()
 
     def __init__(self, base_dir):
         self.base_dir = os.path.abspath(base_dir)
@@ -124,9 +128,8 @@ class WorkSpace(object):
     def _init_workspace(self):
         try:
             os.mkdir(self.base_dir)
-        except EnvironmentError as e:
-            if e.errno != errno.EEXIST:
-                raise
+        except FileExistsError:
+            pass
 
     def _global_lock(self, **kwargs):
         return locket.lock_file(self._global_lock_path, **kwargs)
@@ -177,7 +180,7 @@ class WorkSpace(object):
         for p in glob.glob(os.path.join(self.base_dir, "*" + DIR_LOCK_EXT)):
             try:
                 st = os.stat(p)
-            except EnvironmentError:
+            except OSError:
                 # May have been removed in the meantime
                 pass
             else:
@@ -230,16 +233,16 @@ class WorkSpace(object):
 
         Parameters
         ----------
-        prefix: str (optional)
+        prefix : str (optional)
             The prefix of the temporary subdirectory name for the workdir
-        name: str (optional)
+        name : str (optional)
             The subdirectory name for the workdir
         """
         try:
             self._purge_leftovers()
         except OSError:
             logger.error(
-                "Failed to clean up lingering worker directories " "in path: %s ",
+                "Failed to clean up lingering worker directories in path: %s ",
                 exc_info=True,
             )
         return WorkDir(self, **kwargs)

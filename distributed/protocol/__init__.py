@@ -1,34 +1,37 @@
-from __future__ import print_function, division, absolute_import
-
+from contextlib import suppress
 from functools import partial
 
 from .compression import compressions, default_compression
-from .core import dumps, loads, maybe_compress, decompress, msgpack
-from .cuda import cuda_serialize, cuda_deserialize
+from .core import decompress, dumps, loads, maybe_compress, msgpack
+from .cuda import cuda_deserialize, cuda_serialize
 from .serialize import (
-    serialize,
-    deserialize,
-    nested_deserialize,
     Serialize,
     Serialized,
-    to_serialize,
-    register_serialization,
-    dask_serialize,
     dask_deserialize,
-    serialize_bytes,
+    dask_serialize,
+    deserialize,
     deserialize_bytes,
-    serialize_bytelist,
-    register_serialization_family,
+    nested_deserialize,
     register_generic,
+    register_serialization,
+    register_serialization_family,
+    serialize,
+    serialize_bytelist,
+    serialize_bytes,
+    to_serialize,
 )
-
-from ..utils import ignoring
 
 
 @dask_serialize.register_lazy("numpy")
 @dask_deserialize.register_lazy("numpy")
 def _register_numpy():
     from . import numpy
+
+
+@dask_serialize.register_lazy("scipy")
+@dask_deserialize.register_lazy("scipy")
+def _register_scipy():
+    from . import scipy
 
 
 @dask_serialize.register_lazy("h5py")
@@ -71,17 +74,48 @@ def _register_torch():
 
 @cuda_serialize.register_lazy("cupy")
 @cuda_deserialize.register_lazy("cupy")
+@dask_serialize.register_lazy("cupy")
+@dask_deserialize.register_lazy("cupy")
+@cuda_serialize.register_lazy("cupyx")
+@cuda_deserialize.register_lazy("cupyx")
+@dask_serialize.register_lazy("cupyx")
+@dask_deserialize.register_lazy("cupyx")
 def _register_cupy():
     from . import cupy
 
 
 @cuda_serialize.register_lazy("numba")
 @cuda_deserialize.register_lazy("numba")
+@dask_serialize.register_lazy("numba")
+@dask_deserialize.register_lazy("numba")
 def _register_numba():
     from . import numba
 
 
+@cuda_serialize.register_lazy("rmm")
+@cuda_deserialize.register_lazy("rmm")
+@dask_serialize.register_lazy("rmm")
+@dask_deserialize.register_lazy("rmm")
+def _register_rmm():
+    from . import rmm
+
+
 @cuda_serialize.register_lazy("cudf")
 @cuda_deserialize.register_lazy("cudf")
+@dask_serialize.register_lazy("cudf")
+@dask_deserialize.register_lazy("cudf")
+@cuda_serialize.register_lazy("dask_cudf")
+@cuda_deserialize.register_lazy("dask_cudf")
+@dask_serialize.register_lazy("dask_cudf")
+@dask_deserialize.register_lazy("dask_cudf")
 def _register_cudf():
-    from . import cudf
+    from cudf.comm import serialize
+
+
+@cuda_serialize.register_lazy("cuml")
+@cuda_deserialize.register_lazy("cuml")
+@dask_serialize.register_lazy("cuml")
+@dask_deserialize.register_lazy("cuml")
+def _register_cuml():
+    with suppress(ImportError):
+        from cuml.comm import serialize

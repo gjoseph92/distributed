@@ -1,30 +1,31 @@
-import pytest
 import sys
-import time
-from toolz import first
 import threading
+from time import sleep
 
-from distributed.compatibility import get_thread_identity, WINDOWS
-from distributed import metrics
+import pytest
+from tlz import first
+
+from distributed.compatibility import WINDOWS
+from distributed.metrics import time
 from distributed.profile import (
-    process,
-    merge,
-    create,
     call_stack,
+    create,
     identifier,
-    watch,
-    llprocess,
     ll_get_stack,
+    llprocess,
+    merge,
     plot_data,
+    process,
+    watch,
 )
 
 
 def test_basic():
     def test_g():
-        time.sleep(0.01)
+        sleep(0.01)
 
     def test_h():
-        time.sleep(0.02)
+        sleep(0.02)
 
     def test_f():
         for i in range(100):
@@ -38,7 +39,7 @@ def test_basic():
     state = create()
 
     for i in range(100):
-        time.sleep(0.02)
+        sleep(0.02)
         frame = sys._current_frames()[thread.ident]
         process(frame, None, state)
 
@@ -69,7 +70,7 @@ def test_basic_low_level():
     state = create()
 
     for i in range(100):
-        time.sleep(0.02)
+        sleep(0.02)
         frame = sys._current_frames()[threading.get_ident()]
         llframes = {threading.get_ident(): ll_get_stack(threading.get_ident())}
         for f in llframes.values():
@@ -164,7 +165,7 @@ def test_merge_empty():
 
 
 def test_call_stack():
-    frame = sys._current_frames()[get_thread_identity()]
+    frame = sys._current_frames()[threading.get_ident()]
     L = call_stack(frame)
     assert isinstance(L, list)
     assert all(isinstance(s, str) for s in L)
@@ -172,30 +173,30 @@ def test_call_stack():
 
 
 def test_identifier():
-    frame = sys._current_frames()[get_thread_identity()]
+    frame = sys._current_frames()[threading.get_ident()]
     assert identifier(frame) == identifier(frame)
     assert identifier(None) == identifier(None)
 
 
 def test_watch():
-    start = metrics.time()
+    start = time()
 
     def stop():
-        return metrics.time() > start + 0.500
+        return time() > start + 0.500
 
     start_threads = threading.active_count()
 
     log = watch(interval="10ms", cycle="50ms", stop=stop)
 
-    start = metrics.time()  # wait until thread starts up
+    start = time()  # wait until thread starts up
     while threading.active_count() <= start_threads:
-        assert metrics.time() < start + 2
-        time.sleep(0.01)
+        assert time() < start + 2
+        sleep(0.01)
 
-    time.sleep(0.5)
+    sleep(0.5)
     assert 1 < len(log) < 10
 
-    start = metrics.time()
+    start = time()
     while threading.active_count() > start_threads:
-        assert metrics.time() < start + 2
-        time.sleep(0.01)
+        assert time() < start + 2
+        sleep(0.01)

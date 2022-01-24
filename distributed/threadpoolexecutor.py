@@ -20,15 +20,13 @@ which is included as a comment at the end of this file:
 
    Copyright 2001-2016 Python Software Foundation; All Rights Reserved
 """
-from __future__ import print_function, division, absolute_import
+import itertools
+import logging
+import os
+import queue
+import threading
 
 from . import _concurrent_futures_thread as thread
-from .compatibility import Empty
-import os
-import logging
-import threading
-import itertools
-
 from .metrics import time
 
 logger = logging.getLogger(__name__)
@@ -51,7 +49,7 @@ def _worker(executor, work_queue):
                     break
             try:
                 task = work_queue.get(timeout=1)
-            except Empty:
+            except queue.Empty:
                 continue
             if task is not None:  # sentinel
                 task.run()
@@ -72,7 +70,7 @@ class ThreadPoolExecutor(thread.ThreadPoolExecutor):
     _counter = itertools.count()
 
     def __init__(self, *args, **kwargs):
-        super(ThreadPoolExecutor, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._rejoin_list = []
         self._rejoin_lock = threading.Lock()
         self._thread_name_prefix = kwargs.get(
@@ -108,11 +106,11 @@ class ThreadPoolExecutor(thread.ThreadPoolExecutor):
 
 
 def secede(adjust=True):
-    """ Have this thread secede from the ThreadPoolExecutor
+    """Have this thread secede from the ThreadPoolExecutor
 
     See Also
     --------
-    rejoin: rejoin the thread pool
+    rejoin : rejoin the thread pool
     """
     thread_state.proceed = False
     with threads_lock:
@@ -122,14 +120,14 @@ def secede(adjust=True):
 
 
 def rejoin():
-    """ Have this thread rejoin the ThreadPoolExecutor
+    """Have this thread rejoin the ThreadPoolExecutor
 
     This will block until a new slot opens up in the executor.  The next thread
     to finish a task will leave the pool to allow this one to join.
 
     See Also
     --------
-    secede: leave the thread pool
+    secede : leave the thread pool
     """
     thread = threading.current_thread()
     event = threading.Event()

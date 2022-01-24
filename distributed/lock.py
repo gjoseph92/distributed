@@ -1,22 +1,19 @@
-from __future__ import print_function, division, absolute_import
-
-from collections import defaultdict, deque
-from datetime import timedelta
+import asyncio
 import logging
 import uuid
+from collections import defaultdict, deque
 
-from tornado import gen
-import tornado.locks
+from dask.utils import parse_timedelta
 
-from .client import _get_global_client
-from .utils import log_errors
+from .client import Client
+from .utils import TimeoutError, log_errors
 from .worker import get_worker
 
 logger = logging.getLogger(__name__)
 
 
-class LockExtension(object):
-    """ An extension for the scheduler to manage Locks
+class LockExtension:
+    """An extension for the scheduler to manage Locks
 
     This adds the following routes to the scheduler
 
@@ -35,8 +32,7 @@ class LockExtension(object):
 
         self.scheduler.extensions["locks"] = self
 
-    @gen.coroutine
-    def acquire(self, stream=None, name=None, id=None, timeout=None):
+    async def acquire(self, comm=None, name=None, id=None, timeout=None):
         with log_errors():
             if isinstance(name, list):
                 name = tuple(name)
@@ -44,14 +40,14 @@ class LockExtension(object):
                 result = True
             else:
                 while name in self.ids:
-                    event = tornado.locks.Event()
+                    event = asyncio.Event()
                     self.events[name].append(event)
                     future = event.wait()
                     if timeout is not None:
-                        future = gen.with_timeout(timedelta(seconds=timeout), future)
+                        future = asyncio.wait_for(future, timeout)
                     try:
-                        yield future
-                    except gen.TimeoutError:
+                        await future
+                    except TimeoutError:
                         result = False
                         break
                     else:
@@ -62,9 +58,9 @@ class LockExtension(object):
             if result:
                 assert name not in self.ids
                 self.ids[name] = id
-            raise gen.Return(result)
+            return result
 
-    def release(self, stream=None, name=None, id=None):
+    def release(self, comm=None, name=None, id=None):
         with log_errors():
             if isinstance(name, list):
                 name = tuple(name)
@@ -77,14 +73,18 @@ class LockExtension(object):
                 del self.events[name]
 
 
-class Lock(object):
-    """ Distributed Centralized Lock
+class Lock:
+    """Distributed Centralized Lock
 
     Parameters
     ----------
-    name: string
+    name: string (optional)
         Name of the lock to acquire.  Choosing the same name allows two
-        disconnected processes to coordinate a lock.
+        disconnected processes to coordinate a lock.  If not given, a random
+        name will be generated.
+    client: Client (optional)
+        Client to use for communication with the scheduler.  If not given, the
+        default global client will be used.
 
     Examples
     --------
@@ -95,32 +95,40 @@ class Lock(object):
     """
 
     def __init__(self, name=None, client=None):
-        self.client = client or _get_global_client() or get_worker().client
+        try:
+            self.client = client or Client.current()
+        except ValueError:
+            # Initialise new client
+            self.client = get_worker().client
         self.name = name or "lock-" + uuid.uuid4().hex
         self.id = uuid.uuid4().hex
         self._locked = False
 
     def acquire(self, blocking=True, timeout=None):
-        """ Acquire the lock
+        """Acquire the lock
 
         Parameters
         ----------
         blocking : bool, optional
             If false, don't wait on the lock in the scheduler at all.
-        timeout : number, optional
+        timeout : string or number or timedelta, optional
             Seconds to wait on the lock in the scheduler.  This does not
             include local coroutine time, network transfer time, etc..
             It is forbidden to specify a timeout when blocking is false.
+            Instead of number of seconds, it is also possible to specify
+            a timedelta in string format, e.g. "200ms".
 
         Examples
         --------
         >>> lock = Lock('x')  # doctest: +SKIP
-        >>> lock.acquire(timeout=1)  # doctest: +SKIP
+        >>> lock.acquire(timeout="1s")  # doctest: +SKIP
 
         Returns
         -------
         True or False whether or not it sucessfully acquired the lock
         """
+        timeout = parse_timedelta(timeout)
+
         if not blocking:
             if timeout is not None:
                 raise ValueError("can't specify a timeout for a non-blocking call")
@@ -136,7 +144,7 @@ class Lock(object):
         return result
 
     def release(self):
-        """ Release the lock if already acquired """
+        """Release the lock if already acquired"""
         if not self.locked():
             raise ValueError("Lock is not yet acquired")
         result = self.client.sync(
@@ -155,14 +163,12 @@ class Lock(object):
     def __exit__(self, *args, **kwargs):
         self.release()
 
-    @gen.coroutine
-    def __aenter__(self):
-        yield self.acquire()
-        raise gen.Return(self)
+    async def __aenter__(self):
+        await self.acquire()
+        return self
 
-    @gen.coroutine
-    def __aexit__(self, *args, **kwargs):
-        yield self.release()
+    async def __aexit__(self, *args, **kwargs):
+        await self.release()
 
     def __reduce__(self):
         return (Lock, (self.name,))

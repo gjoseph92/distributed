@@ -1,71 +1,80 @@
-from __future__ import print_function, division, absolute_import
-
-import datetime
-from functools import partial
+import array
+import asyncio
+import contextvars
+import functools
 import io
+import os
+import queue
 import socket
-import sys
-from time import sleep
 import traceback
+from collections import deque
+from time import sleep
 
-import numpy as np
 import pytest
-from tornado import gen
 from tornado.ioloop import IOLoop
 
 import dask
-from distributed.compatibility import Queue, Empty, PY2
+
+from distributed.compatibility import MACOS, WINDOWS
 from distributed.metrics import time
 from distributed.utils import (
+    LRU,
     All,
-    sync,
-    is_kernel,
-    ensure_ip,
-    str_graph,
-    truncate_exception,
-    get_traceback,
-    _maybe_complex,
-    read_block,
-    seek_delimiter,
-    funcname,
-    ensure_bytes,
-    open_port,
-    get_ip_interface,
-    nbytes,
-    set_thread_state,
-    thread_state,
+    Log,
+    Logs,
     LoopRunner,
-    parse_bytes,
-    parse_timedelta,
+    TimeoutError,
+    _maybe_complex,
+    ensure_bytes,
+    ensure_ip,
+    format_dashboard_link,
+    get_ip_interface,
+    get_traceback,
+    is_kernel,
+    is_valid_xml,
+    iscoroutinefunction,
+    nbytes,
+    offload,
+    open_port,
+    parse_ports,
+    read_block,
+    recursive_to_dict,
+    seek_delimiter,
+    set_thread_state,
+    sync,
+    thread_state,
+    truncate_exception,
     warn_on_duration,
 )
-from distributed.utils_test import loop, loop_in_thread  # noqa: F401
-from distributed.utils_test import div, has_ipv6, inc, throws, gen_test, captured_logger
+from distributed.utils_test import (
+    _UnhashableCallable,
+    captured_logger,
+    div,
+    gen_test,
+    has_ipv6,
+    inc,
+    throws,
+)
 
 
 def test_All(loop):
-    @gen.coroutine
-    def throws():
+    async def throws():
         1 / 0
 
-    @gen.coroutine
-    def slow():
-        yield gen.sleep(10)
+    async def slow():
+        await asyncio.sleep(10)
 
-    @gen.coroutine
-    def inc(x):
-        raise gen.Return(x + 1)
+    async def inc(x):
+        return x + 1
 
-    @gen.coroutine
-    def f():
-
-        results = yield All([inc(i) for i in range(10)])
+    async def f():
+        results = await All([inc(i) for i in range(10)])
         assert results == list(range(1, 11))
 
         start = time()
         for tasks in [[throws(), slow()], [slow(), throws()]]:
             try:
-                yield All(tasks)
+                await All(tasks)
                 assert False
             except ZeroDivisionError:
                 pass
@@ -104,8 +113,11 @@ def test_sync_error(loop_in_thread):
 
 def test_sync_timeout(loop_in_thread):
     loop = loop_in_thread
-    with pytest.raises(gen.TimeoutError):
-        sync(loop_in_thread, gen.sleep, 0.5, callback_timeout=0.05)
+    with pytest.raises(TimeoutError):
+        sync(loop_in_thread, asyncio.sleep, 0.5, callback_timeout=0.05)
+
+    with pytest.raises(TimeoutError):
+        sync(loop_in_thread, asyncio.sleep, 0.5, callback_timeout="50ms")
 
 
 def test_sync_closed_loop():
@@ -141,15 +153,12 @@ def test_ensure_ip():
         assert ensure_ip("::1") == "::1"
 
 
+@pytest.mark.skipif(WINDOWS, reason="TODO")
 def test_get_ip_interface():
-    if sys.platform == "darwin":
-        assert get_ip_interface("lo0") == "127.0.0.1"
-    elif sys.platform.startswith("linux"):
-        assert get_ip_interface("lo") == "127.0.0.1"
-    else:
-        pytest.skip("test needs to be enhanced for platform %r" % (sys.platform,))
-    with pytest.raises(KeyError):
-        get_ip_interface("__non-existent-interface")
+    iface = "lo0" if MACOS else "lo"
+    assert get_ip_interface(iface) == "127.0.0.1"
+    with pytest.raises(ValueError, match=f"'__notexist'.+network interface.+'{iface}'"):
+        get_ip_interface("__notexist")
 
 
 def test_truncate_exception():
@@ -179,32 +188,6 @@ def test_get_traceback():
     except Exception as e:
         tb = get_traceback()
         assert type(tb).__name__ == "traceback"
-
-
-def test_str_graph():
-    dsk = {"x": 1}
-    assert str_graph(dsk) == dsk
-
-    dsk = {("x", 1): (inc, 1)}
-    assert str_graph(dsk) == {str(("x", 1)): (inc, 1)}
-
-    dsk = {("x", 1): (inc, 1), ("x", 2): (inc, ("x", 1))}
-    assert str_graph(dsk) == {
-        str(("x", 1)): (inc, 1),
-        str(("x", 2)): (inc, str(("x", 1))),
-    }
-
-    dsks = [
-        {"x": 1},
-        {("x", 1): (inc, 1), ("x", 2): (inc, ("x", 1))},
-        {("x", 1): (sum, [1, 2, 3]), ("x", 2): (sum, [("x", 1), ("x", 1)])},
-    ]
-    for dsk in dsks:
-        sdsk = str_graph(dsk)
-        keys = list(dsk)
-        skeys = [str(k) for k in keys]
-        assert all(isinstance(k, str) for k in sdsk)
-        assert dask.get(dsk, keys) == dask.get(sdsk, skeys)
 
 
 def test_maybe_complex():
@@ -264,26 +247,30 @@ def test_seek_delimiter_endline():
     assert f.tell() == 7
 
 
-def test_funcname():
-    def f():
-        pass
-
-    assert funcname(f) == "f"
-    assert funcname(partial(f)) == "f"
-    assert funcname(partial(partial(f))) == "f"
-
-
 def test_ensure_bytes():
-    data = [b"1", "1", memoryview(b"1"), bytearray(b"1")]
-    if PY2:
-        data.append(buffer(b"1"))  # noqa: F821
+    data = [b"1", "1", memoryview(b"1"), bytearray(b"1"), array.array("b", [49])]
     for d in data:
         result = ensure_bytes(d)
         assert isinstance(result, bytes)
         assert result == b"1"
 
 
+def test_ensure_bytes_ndarray():
+    np = pytest.importorskip("numpy")
+    result = ensure_bytes(np.arange(12))
+    assert isinstance(result, bytes)
+
+
+def test_ensure_bytes_pyarrow_buffer():
+    pa = pytest.importorskip("pyarrow")
+    buf = pa.py_buffer(b"123")
+    result = ensure_bytes(buf)
+    assert isinstance(result, bytes)
+
+
 def test_nbytes():
+    np = pytest.importorskip("numpy")
+
     def check(obj, expected):
         assert nbytes(obj) == expected
         assert nbytes(memoryview(obj)) == expected
@@ -316,7 +303,7 @@ def assert_running(loop):
     """
     Raise if the given IOLoop is not running.
     """
-    q = Queue()
+    q = queue.Queue()
     loop.add_callback(q.put, 42)
     assert q.get(timeout=1) == 42
 
@@ -325,14 +312,14 @@ def assert_not_running(loop):
     """
     Raise if the given IOLoop is running.
     """
-    q = Queue()
+    q = queue.Queue()
     try:
         loop.add_callback(q.put, 42)
     except RuntimeError:
         # On AsyncIOLoop, can't add_callback() after the loop is closed
         pass
     else:
-        with pytest.raises(Empty):
+        with pytest.raises(queue.Empty):
             q.get(timeout=0.02)
 
 
@@ -459,74 +446,34 @@ def test_two_loop_runners(loop_in_thread):
 
 
 @gen_test()
-def test_loop_runner_gen():
+async def test_loop_runner_gen():
     runner = LoopRunner(asynchronous=True)
     assert runner.loop is IOLoop.current()
     assert not runner.is_started()
-    yield gen.sleep(0.01)
+    await asyncio.sleep(0.01)
     runner.start()
     assert runner.is_started()
-    yield gen.sleep(0.01)
+    await asyncio.sleep(0.01)
     runner.stop()
     assert not runner.is_started()
-    yield gen.sleep(0.01)
-
-
-def test_parse_bytes():
-    assert parse_bytes("100") == 100
-    assert parse_bytes("100 MB") == 100000000
-    assert parse_bytes("100M") == 100000000
-    assert parse_bytes("5kB") == 5000
-    assert parse_bytes("5.4 kB") == 5400
-    assert parse_bytes("1kiB") == 1024
-    assert parse_bytes("1Mi") == 2 ** 20
-    assert parse_bytes("1e6") == 1000000
-    assert parse_bytes("1e6 kB") == 1000000000
-    assert parse_bytes("MB") == 1000000
-
-
-def test_parse_timedelta():
-    for text, value in [
-        ("1s", 1),
-        ("100ms", 0.1),
-        ("5S", 5),
-        ("5.5s", 5.5),
-        ("5.5 s", 5.5),
-        ("1 second", 1),
-        ("3.3 seconds", 3.3),
-        ("3.3 milliseconds", 0.0033),
-        ("3500 us", 0.0035),
-        ("1 ns", 1e-9),
-        ("2m", 120),
-        ("2 minutes", 120),
-        (datetime.timedelta(seconds=2), 2),
-        (datetime.timedelta(milliseconds=100), 0.1),
-    ]:
-        result = parse_timedelta(text)
-        assert abs(result - value) < 1e-14
-
-    assert parse_timedelta("1ms", default="seconds") == 0.001
-    assert parse_timedelta("1", default="seconds") == 1
-    assert parse_timedelta("1", default="ms") == 0.001
-    assert parse_timedelta(1, default="ms") == 0.001
+    await asyncio.sleep(0.01)
 
 
 @gen_test()
-def test_all_exceptions_logging():
-    @gen.coroutine
-    def throws():
+async def test_all_exceptions_logging():
+    async def throws():
         raise Exception("foo1234")
 
     with captured_logger("") as sio:
         try:
-            yield All([throws() for _ in range(5)], quiet_exceptions=Exception)
+            await All([throws() for _ in range(5)], quiet_exceptions=Exception)
         except Exception:
             pass
 
         import gc
 
         gc.collect()
-        yield gen.sleep(0.1)
+        await asyncio.sleep(0.1)
 
     assert "foo1234" not in sio.getvalue()
 
@@ -545,6 +492,211 @@ def test_warn_on_duration():
     assert any("foo" in str(rec.message) for rec in record)
 
 
-def test_format_bytes_compat():
-    # moved to dask, but exported here for compatibility
-    from distributed.utils import format_bytes  # noqa
+def test_logs():
+    log = Log("Hello")
+    assert isinstance(log, str)
+    d = Logs({"123": log, "456": Log("World!")})
+    assert isinstance(d, dict)
+    text = d._repr_html_()
+    assert is_valid_xml("<div>" + text + "</div>")
+    assert "Hello" in text
+    assert "456" in text
+
+
+def test_is_valid_xml():
+    assert is_valid_xml("<a>foo</a>")
+    with pytest.raises(Exception):
+        assert is_valid_xml("<a>foo")
+
+
+def test_format_dashboard_link():
+    with dask.config.set({"distributed.dashboard.link": "foo"}):
+        assert format_dashboard_link("host", 1234) == "foo"
+
+    assert "host" in format_dashboard_link("host", 1234)
+    assert "1234" in format_dashboard_link("host", 1234)
+
+    try:
+        os.environ["host"] = "hello"
+        assert "hello" not in format_dashboard_link("host", 1234)
+    finally:
+        del os.environ["host"]
+
+
+def test_parse_ports():
+    assert parse_ports(None) == [None]
+    assert parse_ports(23) == [23]
+    assert parse_ports("45") == [45]
+    assert parse_ports("100:103") == [100, 101, 102, 103]
+
+    with pytest.raises(ValueError, match="port_stop must be greater than port_start"):
+        parse_ports("103:100")
+
+
+def test_lru():
+
+    l = LRU(maxsize=3)
+    l["a"] = 1
+    l["b"] = 2
+    l["c"] = 3
+    assert list(l.keys()) == ["a", "b", "c"]
+
+    # Use "a" and ensure it becomes the most recently used item
+    l["a"]
+    assert list(l.keys()) == ["b", "c", "a"]
+
+    # Ensure maxsize is respected
+    l["d"] = 4
+    assert len(l) == 3
+    assert list(l.keys()) == ["c", "a", "d"]
+
+
+@pytest.mark.asyncio
+async def test_offload():
+    assert (await offload(inc, 1)) == 2
+    assert (await offload(lambda x, y: x + y, 1, y=2)) == 3
+
+
+@pytest.mark.asyncio
+async def test_offload_preserves_contextvars():
+    var = contextvars.ContextVar("var")
+
+    async def set_var(v: str):
+        var.set(v)
+        r = await offload(var.get)
+        assert r == v
+
+    await asyncio.gather(set_var("foo"), set_var("bar"))
+
+
+def test_serialize_for_cli_deprecated():
+    with pytest.warns(FutureWarning, match="serialize_for_cli is deprecated"):
+        from distributed.utils import serialize_for_cli
+    assert serialize_for_cli is dask.config.serialize
+
+
+def test_deserialize_for_cli_deprecated():
+    with pytest.warns(FutureWarning, match="deserialize_for_cli is deprecated"):
+        from distributed.utils import deserialize_for_cli
+    assert deserialize_for_cli is dask.config.deserialize
+
+
+def test_parse_bytes_deprecated():
+    with pytest.warns(FutureWarning, match="parse_bytes is deprecated"):
+        from distributed.utils import parse_bytes
+    assert parse_bytes is dask.utils.parse_bytes
+
+
+def test_format_bytes_deprecated():
+    with pytest.warns(FutureWarning, match="format_bytes is deprecated"):
+        from distributed.utils import format_bytes
+    assert format_bytes is dask.utils.format_bytes
+
+
+def test_format_time_deprecated():
+    with pytest.warns(FutureWarning, match="format_time is deprecated"):
+        from distributed.utils import format_time
+    assert format_time is dask.utils.format_time
+
+
+def test_funcname_deprecated():
+    with pytest.warns(FutureWarning, match="funcname is deprecated"):
+        from distributed.utils import funcname
+    assert funcname is dask.utils.funcname
+
+
+def test_parse_timedelta_deprecated():
+    with pytest.warns(FutureWarning, match="parse_timedelta is deprecated"):
+        from distributed.utils import parse_timedelta
+    assert parse_timedelta is dask.utils.parse_timedelta
+
+
+def test_typename_deprecated():
+    with pytest.warns(FutureWarning, match="typename is deprecated"):
+        from distributed.utils import typename
+    assert typename is dask.utils.typename
+
+
+def test_tmpfile_deprecated():
+    with pytest.warns(FutureWarning, match="tmpfile is deprecated"):
+        from distributed.utils import tmpfile
+    assert tmpfile is dask.utils.tmpfile
+
+
+def test_iscoroutinefunction_unhashable_input():
+    # Ensure iscoroutinefunction can handle unhashable callables
+    assert not iscoroutinefunction(_UnhashableCallable())
+
+
+def test_iscoroutinefunction_nested_partial():
+    async def my_async_callable(x, y, z):
+        pass
+
+    assert iscoroutinefunction(
+        functools.partial(functools.partial(my_async_callable, 1), 2)
+    )
+
+
+def test_recursive_to_dict():
+    class C:
+        def __init__(self, x):
+            self.x = x
+
+        def __repr__(self):
+            return "<C>"
+
+        def _to_dict(self, *, exclude):
+            assert exclude == ["foo"]
+            return ["C:", recursive_to_dict(self.x, exclude=exclude)]
+
+    class D:
+        def __repr__(self):
+            return "<D>"
+
+    inp = [
+        1,
+        1.1,
+        True,
+        False,
+        None,
+        "foo",
+        b"bar",
+        C,
+        C(1),
+        D(),
+        (1, 2),
+        [3, 4],
+        {5, 6},
+        frozenset([7, 8]),
+        deque([9, 10]),
+    ]
+    expect = [
+        1,
+        1.1,
+        True,
+        False,
+        None,
+        "foo",
+        "b'bar'",
+        "<class 'test_utils.test_recursive_to_dict.<locals>.C'>",
+        ["C:", 1],
+        "<D>",
+        [1, 2],
+        [3, 4],
+        list({5, 6}),
+        list(frozenset([7, 8])),
+        [9, 10],
+    ]
+    assert recursive_to_dict(inp, exclude=["foo"]) == expect
+
+    # Test recursion
+    a = []
+    c = C(a)
+    a += [c, c]
+    # The blocklist of already-seen objects is reentrant: a is converted to string when
+    # found inside itself; c must *not* be converted to string the second time it's
+    # found, because it's outside of itself.
+    assert recursive_to_dict(a, exclude=["foo"]) == [
+        ["C:", "[<C>, <C>]"],
+        ["C:", "[<C>, <C>]"],
+    ]

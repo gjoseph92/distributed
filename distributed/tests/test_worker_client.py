@@ -1,30 +1,29 @@
-from __future__ import print_function, division, absolute_import
-
+import asyncio
 import random
 import threading
-from time import sleep
 import warnings
+from collections import defaultdict
+from time import sleep
+
+import pytest
 
 import dask
 from dask import delayed
-import pytest
-from tornado import gen
 
 from distributed import (
-    worker_client,
     Client,
     as_completed,
+    get_client,
     get_worker,
     wait,
-    get_client,
+    worker_client,
 )
 from distributed.metrics import time
-from distributed.utils_test import double, gen_cluster, inc
-from distributed.utils_test import client, cluster_fixture, loop  # noqa: F401
+from distributed.utils_test import double, gen_cluster, inc, slowinc
 
 
 @gen_cluster(client=True)
-def test_submit_from_worker(c, s, a, b):
+async def test_submit_from_worker(c, s, a, b):
     def func(x):
         with worker_client() as c:
             x = c.submit(inc, x)
@@ -33,7 +32,7 @@ def test_submit_from_worker(c, s, a, b):
             return result
 
     x, y = c.map(func, [10, 20])
-    xx, yy = yield c._gather([x, y])
+    xx, yy = await c._gather([x, y])
 
     assert xx == 10 + 1 + (10 + 1) * 2
     assert yy == 20 + 1 + (20 + 1) * 2
@@ -43,7 +42,7 @@ def test_submit_from_worker(c, s, a, b):
 
 
 @gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 2)
-def test_scatter_from_worker(c, s, a, b):
+async def test_scatter_from_worker(c, s, a, b):
     def func():
         with worker_client() as c:
             futures = c.scatter([1, 2, 3, 4, 5])
@@ -58,7 +57,7 @@ def test_scatter_from_worker(c, s, a, b):
             return total.result()
 
     future = c.submit(func)
-    result = yield future
+    result = await future
     assert result == sum([1, 2, 3, 4, 5])
 
     def func():
@@ -74,17 +73,17 @@ def test_scatter_from_worker(c, s, a, b):
             return correct
 
     future = c.submit(func)
-    result = yield future
+    result = await future
     assert result is True
 
     start = time()
     while not all(v == 1 for v in s.nthreads.values()):
-        yield gen.sleep(0.1)
+        await asyncio.sleep(0.1)
         assert time() < start + 5
 
 
 @gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 2)
-def test_scatter_singleton(c, s, a, b):
+async def test_scatter_singleton(c, s, a, b):
     np = pytest.importorskip("numpy")
 
     def func():
@@ -93,11 +92,11 @@ def test_scatter_singleton(c, s, a, b):
             future = c.scatter(x)
             assert future.type == np.ndarray
 
-    yield c.submit(func)
+    await c.submit(func)
 
 
 @gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 2)
-def test_gather_multi_machine(c, s, a, b):
+async def test_gather_multi_machine(c, s, a, b):
     a_address = a.address
     b_address = b.address
     assert a_address != b_address
@@ -111,19 +110,19 @@ def test_gather_multi_machine(c, s, a, b):
         return xx, yy
 
     future = c.submit(func)
-    result = yield future
+    result = await future
 
     assert result == (2, 3)
 
 
 @gen_cluster(client=True)
-def test_same_loop(c, s, a, b):
+async def test_same_loop(c, s, a, b):
     def f():
         with worker_client() as lc:
             return lc.loop is get_worker().loop
 
     future = c.submit(f)
-    result = yield future
+    result = await future
     assert result
 
 
@@ -142,7 +141,7 @@ def test_sync(client):
 
 
 @gen_cluster(client=True)
-def test_async(c, s, a, b):
+async def test_async(c, s, a, b):
     def mysum():
         result = 0
         sub_tasks = [delayed(double)(i) for i in range(100)]
@@ -154,16 +153,16 @@ def test_async(c, s, a, b):
         return result
 
     future = c.compute(delayed(mysum)())
-    yield future
+    await future
 
     start = time()
     while len(a.data) + len(b.data) > 1:
-        yield gen.sleep(0.1)
+        await asyncio.sleep(0.1)
         assert time() < start + 3
 
 
 @gen_cluster(client=True, nthreads=[("127.0.0.1", 3)])
-def test_separate_thread_false(c, s, a):
+async def test_separate_thread_false(c, s, a):
     a.count = 0
 
     def f(i):
@@ -176,19 +175,19 @@ def test_separate_thread_false(c, s, a):
         return i
 
     futures = c.map(f, range(20))
-    results = yield c._gather(futures)
+    results = await c._gather(futures)
     assert list(results) == list(range(20))
 
 
 @gen_cluster(client=True)
-def test_client_executor(c, s, a, b):
+async def test_client_executor(c, s, a, b):
     def mysum():
         with worker_client() as c:
             with c.get_executor() as e:
                 return sum(e.map(double, range(30)))
 
     future = c.submit(mysum)
-    result = yield future
+    result = await future
     assert result == 30 * 29
 
 
@@ -203,7 +202,7 @@ def test_dont_override_default_get(loop):
     b2 = b.map(f)
 
     with Client(
-        loop=loop, processes=False, set_as_default=True, dashboard_address=None
+        loop=loop, processes=False, set_as_default=True, dashboard_address=":0"
     ) as c:
         assert dask.base.get_scheduler() == c.get
         for i in range(2):
@@ -213,7 +212,7 @@ def test_dont_override_default_get(loop):
 
 
 @gen_cluster(client=True)
-def test_local_client_warning(c, s, a, b):
+async def test_local_client_warning(c, s, a, b):
     from distributed import local_client
 
     def func(x):
@@ -225,18 +224,18 @@ def test_local_client_warning(c, s, a, b):
             return result
 
     future = c.submit(func, 10)
-    result = yield future
+    result = await future
     assert result == 11
 
 
 @gen_cluster(client=True)
-def test_closing_worker_doesnt_close_client(c, s, a, b):
+async def test_closing_worker_doesnt_close_client(c, s, a, b):
     def func(x):
         get_client()
         return
 
-    yield wait(c.map(func, range(10)))
-    yield a.close()
+    await wait(c.map(func, range(10)))
+    await a.close()
     assert c.status == "running"
 
 
@@ -262,15 +261,15 @@ def test_secede_without_stealing_issue_1262():
     # run the loop as an inner function so all workers are closed
     # and exceptions can be examined
     @gen_cluster(client=True, scheduler_kwargs={"extensions": extensions})
-    def secede_test(c, s, a, b):
+    async def secede_test(c, s, a, b):
         def func(x):
             with worker_client() as wc:
                 y = wc.submit(lambda: 1 + x)
                 return wc.gather(y)
 
-        f = yield c.gather(c.submit(func, 1))
+        f = await c.gather(c.submit(func, 1))
 
-        raise gen.Return((c, s, a, b, f))
+        return c, s, a, b, f
 
     c, s, a, b, f = secede_test()
 
@@ -280,40 +279,64 @@ def test_secede_without_stealing_issue_1262():
 
 
 @gen_cluster(client=True)
-def test_compute_within_worker_client(c, s, a, b):
+async def test_compute_within_worker_client(c, s, a, b):
     @dask.delayed
     def f():
         with worker_client():
             return dask.delayed(lambda x: x)(1).compute()
 
-    result = yield c.compute(f())
+    result = await c.compute(f())
     assert result == 1
 
 
 @gen_cluster(client=True)
-def test_worker_client_rejoins(c, s, a, b):
+async def test_worker_client_rejoins(c, s, a, b):
     def f():
         with worker_client():
             pass
 
         return threading.current_thread() in get_worker().executor._threads
 
-    result = yield c.submit(f)
+    result = await c.submit(f)
     assert result
 
 
 @gen_cluster()
-def test_submit_different_names(s, a, b):
+async def test_submit_different_names(s, a, b):
     # https://github.com/dask/distributed/issues/2058
     da = pytest.importorskip("dask.array")
-    c = yield Client(
+    c = await Client(
         "localhost:" + s.address.split(":")[-1], loop=s.loop, asynchronous=True
     )
     try:
         X = c.persist(da.random.uniform(size=(100, 10), chunks=50))
-        yield wait(X)
+        await wait(X)
 
-        fut = yield c.submit(lambda x: x.sum().compute(), X)
+        fut = await c.submit(lambda x: x.sum().compute(), X)
         assert fut > 0
     finally:
-        yield c.close()
+        await c.close()
+
+
+@gen_cluster(client=True)
+async def test_secede_does_not_claim_worker(c, s, a, b):
+    """A seceded task must not block the task running it. Tasks scheduled from
+    within should be evenly distributed"""
+    # https://github.com/dask/distributed/issues/5332
+    def get_addr(x):
+        w = get_worker()
+        slowinc(x)
+        return w.address
+
+    def long_running():
+        with worker_client() as client:
+            futs = client.map(get_addr, range(100))
+            workers = defaultdict(int)
+            for f in futs:
+                workers[f.result()] += 1
+            return dict(workers)
+
+    res = await c.submit(long_running)
+    assert len(res) == 2
+    assert res[a.address] > 25
+    assert res[b.address] > 25

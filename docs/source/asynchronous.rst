@@ -44,32 +44,44 @@ received information from the scheduler should now be ``await``'ed.
 
    result = await client.gather(future)
 
-If you want to reuse the same client in asynchronous and synchronous
-environments you can apply the ``asynchronous=True`` keyword at each method
-call.
+
+If you want to use an asynchronous function with a synchronous ``Client``
+(one made without the ``asynchronous=True`` keyword) then you can apply the
+``asynchronous=True`` keyword at each method call and use the ``Client.sync``
+function to run the asynchronous function:
 
 .. code-block:: python
+
+   from dask.distributed import Client
 
    client = Client()  # normal blocking client
 
    async def f():
-       futures = client.map(func, L)
-       results = await client.gather(futures, asynchronous=True)
-       return results
+       future = client.submit(lambda x: x + 1, 10)
+       result = await client.gather(future, asynchronous=True)
+       return result
+
+   client.sync(f)
 
 
-Python 2 Compatibility
-----------------------
+.. note: Blocking operations like the .compute() method aren’t ok to use in
+         asynchronous mode. Instead you’ll have to use the Client.compute
+         method
 
-Everything here works with Python 2 if you replace ``await`` with ``yield``.
-See more extensive comparison in the example below.
+
+.. code-block:: python
+
+    async with Client(asynchronous=True) as client:
+        arr = da.random.random((1000, 1000), chunks=(1000, 100))
+        await client.compute(arr.mean())
+
 
 Example
 -------
 
 This self-contained example starts an asynchronous client, submits a trivial
-job, waits on the result, and then shuts down the client.  You can see
-implementations for Python 2 and 3 and for Asyncio and Tornado.
+job, waits on the result, and then shuts down the client. You can see
+implementations for Asyncio and Tornado.
 
 Python 3 with Tornado or Asyncio
 ++++++++++++++++++++++++++++++++
@@ -93,25 +105,6 @@ Python 3 with Tornado or Asyncio
    import asyncio
    asyncio.get_event_loop().run_until_complete(f())
 
-
-Python 2/3 with Tornado
-+++++++++++++++++++++++
-
-.. code-block:: python
-
-   from dask.distributed import Client
-   from tornado import gen
-
-   @gen.coroutine
-   def f():
-       client = yield Client(asynchronous=True)
-       future = client.submit(lambda x: x + 1, 10)
-       result = yield future
-       yield client.close()
-       raise gen.Result(result)
-
-   from tornado.ioloop import IOLoop
-   IOLoop().run_sync(f)
 
 Use Cases
 ---------

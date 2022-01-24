@@ -73,3 +73,35 @@ the scheduler as so:
    def dask_setup(scheduler):
        plugin = MyPlugin(scheduler)
        scheduler.add_plugin(plugin)
+
+Worker Plugins
+==============
+
+:class:`distributed.diagnostics.plugin.WorkerPlugin` provides a base class
+for creating your own worker plugins. In addition, Dask provides some
+:ref:`built-in plugins <plugins.builtin>`.
+
+.. autoclass:: distributed.diagnostics.plugin.WorkerPlugin
+   :members:
+
+.. _plugins.builtin:
+
+Built-In Worker Plugins
+-----------------------
+
+.. autoclass:: distributed.diagnostics.plugin.PipInstall
+.. autoclass:: distributed.diagnostics.plugin.UploadFile
+
+
+Nanny Plugins
+=============
+
+.. autoclass:: distributed.diagnostics.plugin.NannyPlugin
+   :members:
+
+
+Built-In Nanny Plugins
+----------------------
+
+.. autoclass:: distributed.diagnostics.plugin.Environ
+.. autoclass:: distributed.diagnostics.plugin.UploadDirectory

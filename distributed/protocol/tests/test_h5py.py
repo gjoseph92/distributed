@@ -5,27 +5,24 @@ import pytest
 
 h5py = pytest.importorskip("h5py")
 
-from distributed.protocol import deserialize, serialize
+from dask.utils import tmpfile
 
-from distributed.utils import PY3, tmpfile
+from distributed.protocol import deserialize, serialize
 
 
 def silence_h5py_issue775(func):
     @functools.wraps(func)
     def wrapper():
-        if PY3:
-            try:
-                func()
-            except RuntimeError as e:
-                # https://github.com/h5py/h5py/issues/775
-                if str(e) != "dictionary changed size during iteration":
-                    raise
-                tb = traceback.extract_tb(e.__traceback__)
-                filename, lineno, _, _ = tb[-1]
-                if not filename.endswith("h5py/_objects.pyx"):
-                    raise
-        else:
+        try:
             func()
+        except RuntimeError as e:
+            # https://github.com/h5py/h5py/issues/775
+            if str(e) != "dictionary changed size during iteration":
+                raise
+            tb = traceback.extract_tb(e.__traceback__)
+            filename, lineno, _, _ = tb[-1]
+            if not filename.endswith("h5py/_objects.pyx"):
+                raise
 
     return wrapper
 
@@ -85,15 +82,14 @@ def test_raise_error_on_serialize_write_permissions():
                 deserialize(*serialize(f))
 
 
-from distributed.utils_test import gen_cluster
-
-
 import dask.array as da
+
+from distributed.utils_test import gen_cluster
 
 
 @silence_h5py_issue775
 @gen_cluster(client=True)
-def test_h5py_serialize(c, s, a, b):
+async def test_h5py_serialize(c, s, a, b):
     from dask.utils import SerializableLock
 
     lock = SerializableLock("hdf5")
@@ -105,12 +101,12 @@ def test_h5py_serialize(c, s, a, b):
             dset = f["/group/x"]
             x = da.from_array(dset, chunks=dset.chunks, lock=lock)
             y = c.compute(x)
-            y = yield y
+            y = await y
             assert (y[:] == dset[:]).all()
 
 
 @gen_cluster(client=True)
-def test_h5py_serialize_2(c, s, a, b):
+async def test_h5py_serialize_2(c, s, a, b):
     with tmpfile() as fn:
         with h5py.File(fn, mode="a") as f:
             x = f.create_dataset("/group/x", shape=(12,), dtype="i4", chunks=(4,))
@@ -119,5 +115,5 @@ def test_h5py_serialize_2(c, s, a, b):
             dset = f["/group/x"]
             x = da.from_array(dset, chunks=(3,))
             y = c.compute(x.sum())
-            y = yield y
+            y = await y
             assert y == (1 + 2 + 3 + 4) * 3

@@ -1,8 +1,8 @@
-from __future__ import print_function, division, absolute_import
-
-from tornado import gen
+import click
+from packaging.version import parse as parse_version
 from tornado.ioloop import IOLoop
 
+CLICK_VERSION = parse_version(click.__version__)
 
 py3_err_msg = """
 Warning: Your terminal does not set locales.
@@ -28,13 +28,20 @@ def check_python_3():
     # https://github.com/pallets/click/issues/448#issuecomment-246029304
     import click.core
 
-    click.core._verify_python3_env = lambda: None
+    # TODO: Remove use of internal click functions
+    if CLICK_VERSION < parse_version("8.0.0"):
+        click.core._verify_python3_env = lambda: None
+    else:
+        click.core._verify_python_env = lambda: None
 
     try:
         from click import _unicodefun
 
-        _unicodefun._verify_python3_env()
-    except (TypeError, RuntimeError) as e:
+        if CLICK_VERSION < parse_version("8.0.0"):
+            _unicodefun._verify_python3_env()
+        else:
+            _unicodefun._verify_python_env()
+    except (TypeError, RuntimeError):
         import click
 
         click.echo(py3_err_msg, err=True)
@@ -53,11 +60,10 @@ def install_signal_handlers(loop=None, cleanup=None):
     old_handlers = {}
 
     def handle_signal(sig, frame):
-        @gen.coroutine
-        def cleanup_and_stop():
+        async def cleanup_and_stop():
             try:
                 if cleanup is not None:
-                    yield cleanup(sig)
+                    await cleanup(sig)
             finally:
                 loop.stop()
 
