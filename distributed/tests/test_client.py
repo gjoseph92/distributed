@@ -2939,21 +2939,33 @@ async def test_rebalance(c, s, *_):
     """Test Client.rebalance(). These are just to test the Client wrapper around
     Scheduler.rebalance(); for more thorough tests on the latter see test_scheduler.py.
     """
+
+    def print_memory(msg: str):
+        print(f"*** {msg} ***")
+        for addr, w in s.workers.items():
+            print(addr)
+            print(w.memory)
+
     # We used nannies to have separate processes for each worker
     a, b = s.workers
 
     # Generate 10 buffers worth 512 MiB total on worker a. This sends its memory
     # utilisation slightly above 50% (after counting unmanaged) which is above the
     # distributed.worker.memory.rebalance.sender-min threshold.
+    print_memory("before submit data")
     futures = c.map(lambda _: "x" * (2 ** 29 // 10), range(10), workers=[a])
     await wait(futures)
     # Wait for heartbeats
     while s.memory.process < 2 ** 29:
         await asyncio.sleep(0.1)
 
+    print_memory("after heartbeats")
+
     assert await c.run(lambda dask_worker: len(dask_worker.data)) == {a: 10, b: 0}
 
     await c.rebalance()
+
+    print_memory("after rebalance")
 
     ndata = await c.run(lambda dask_worker: len(dask_worker.data))
     # Allow for some uncertainty as the unmanaged memory is not stable
