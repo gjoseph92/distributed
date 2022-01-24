@@ -123,6 +123,7 @@ jobs:
           pytest distributed/tests/test_tls_functional.py::test_rebalance \
             distributed/tests/test_client.py::test_rebalance \
             distributed/tests/test_scheduler.py::test_rebalance \
+            -s \
             -m "not avoid_ci and ${{ matrix.partition }}" --runslow \
             --junitxml reports/pytest.xml -o junit_suite_name=$TEST_ID --cov=distributed --cov-report=xml
 
