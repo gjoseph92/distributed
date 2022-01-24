@@ -1,8 +1,6 @@
-from __future__ import print_function, division, absolute_import
-
-from .serialize import dask_serialize, dask_deserialize
-
 import h5py
+
+from .serialize import dask_deserialize, dask_serialize
 
 
 @dask_serialize.register(h5py.File)

@@ -5,19 +5,17 @@
 
 """Implements ThreadPoolExecutor."""
 
+from __future__ import annotations
+
 __author__ = "Brian Quinlan (brian@sweetapp.com)"
 
 import atexit
-from concurrent.futures import _base
 import itertools
-
-try:
-    import queue
-except ImportError:
-    import Queue as queue
+import os
+import queue
 import threading
 import weakref
-import os
+from concurrent.futures import _base
 
 # Workers are created as daemon threads. This is done to allow the interpreter
 # to exit when there are still idle threads in a ThreadPoolExecutor's thread
@@ -33,7 +31,9 @@ import os
 # workers to exit when their work queues are empty and then waits until the
 # threads finish.
 
-_threads_queues = weakref.WeakKeyDictionary()
+_threads_queues: weakref.WeakKeyDictionary[
+    threading.Thread, queue.Queue
+] = weakref.WeakKeyDictionary()
 _shutdown = False
 
 
@@ -50,7 +50,7 @@ def _python_exit():
 atexit.register(_python_exit)
 
 
-class _WorkItem(object):
+class _WorkItem:
     def __init__(self, future, fn, args, kwargs):
         self.future = future
         self.fn = fn

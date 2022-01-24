@@ -1,8 +1,8 @@
+numpydoc
 tornado
 toolz
 cloudpickle
-dask
-numpydoc
+git+https://github.com/dask/dask
 sphinx
-dask_sphinx_theme
+dask-sphinx-theme>=2
 sphinx-click

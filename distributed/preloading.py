@@ -1,13 +1,22 @@
-import atexit
+from __future__ import annotations
+
+import filecmp
+import inspect
 import logging
 import os
 import shutil
 import sys
-import filecmp
+import urllib.request
+from collections.abc import Iterable
 from importlib import import_module
+from types import ModuleType
+from typing import cast
 
 import click
 
+from dask.utils import tmpfile
+
+from .core import Server
 from .utils import import_file
 
 logger = logging.getLogger(__name__)
@@ -29,12 +38,16 @@ def validate_preload_argv(ctx, param, value):
             % ("s" if len(value) > 1 else "", " ".join(value))
         )
 
-    preload_modules = _import_modules(ctx.params.get("preload"))
+    preload_modules = {
+        name: _import_module(name)
+        for name in ctx.params.get("preload")
+        if not is_webaddress(name)
+    }
 
     preload_commands = [
-        m["dask_setup"]
+        getattr(m, "dask_setup", None)
         for m in preload_modules.values()
-        if isinstance(m["dask_setup"], click.Command)
+        if isinstance(getattr(m, "dask_setup", None), click.Command)
     ]
 
     if len(preload_commands) > 1:
@@ -58,18 +71,21 @@ def validate_preload_argv(ctx, param, value):
     return value
 
 
-def _import_modules(names, file_dir=None):
-    """ Imports modules and extracts preload interface functions.
+def is_webaddress(s: str) -> bool:
+    return any(s.startswith(prefix) for prefix in ("http://", "https://"))
 
-    Imports modules specified by names and extracts 'dask_setup'
+
+def _import_module(name, file_dir=None) -> ModuleType:
+    """Imports module and extract preload interface functions.
+
+    Import modules specified by name and extract 'dask_setup'
     and 'dask_teardown' if present.
-
 
     Parameters
     ----------
-    names: list of strings
-        Module names or file paths
-    file_dir: string
+    name : str
+        Module name, file path, or text of module or script
+    file_dir : string
         Path of a directory where files should be copied
 
     Returns
@@ -77,68 +93,135 @@ def _import_modules(names, file_dir=None):
     Nest dict of names to extracted module interface components if present
     in imported module.
     """
-    result_modules = {}
-
-    for name in names:
-        # import
-        if name.endswith(".py"):
-            # name is a file path
-            if file_dir is not None:
-                basename = os.path.basename(name)
-                copy_dst = os.path.join(file_dir, basename)
-                if os.path.exists(copy_dst):
-                    if not filecmp.cmp(name, copy_dst):
-                        logger.error("File name collision: %s", basename)
-                shutil.copy(name, copy_dst)
-                module = import_file(copy_dst)[0]
-            else:
-                module = import_file(name)[0]
-
+    if name.endswith(".py"):
+        # name is a file path
+        if file_dir is not None:
+            basename = os.path.basename(name)
+            copy_dst = os.path.join(file_dir, basename)
+            if os.path.exists(copy_dst):
+                if not filecmp.cmp(name, copy_dst):
+                    logger.error("File name collision: %s", basename)
+            shutil.copy(name, copy_dst)
+            module = import_file(copy_dst)[0]
         else:
-            # name is a module name
-            if name not in sys.modules:
-                import_module(name)
-            module = sys.modules[name]
+            module = import_file(name)[0]
 
-        logger.info("Import preload module: %s", name)
-        result_modules[name] = {
-            attrname: getattr(module, attrname, None)
-            for attrname in ("dask_setup", "dask_teardown")
-        }
+    elif " " not in name:
+        # name is a module name
+        if name not in sys.modules:
+            import_module(name)
+        module = sys.modules[name]
 
-    return result_modules
+    else:
+        # not a name, actually the text of the script
+        with tmpfile(extension=".py") as fn:
+            with open(fn, mode="w") as f:
+                f.write(name)
+            return _import_module(fn, file_dir=file_dir)
+
+    logger.info("Import preload module: %s", name)
+    return module
 
 
-def preload_modules(names, parameter=None, file_dir=None, argv=None):
-    """ Imports modules, handles `dask_setup` and `dask_teardown`.
+def _download_module(url: str) -> ModuleType:
+    logger.info("Downloading preload at %s", url)
+    assert is_webaddress(url)
+
+    request = urllib.request.Request(url, method="GET")
+    response = urllib.request.urlopen(request)
+    source = response.read().decode()
+
+    compiled = compile(source, url, "exec")
+    module = ModuleType(url)
+    exec(compiled, module.__dict__)
+    return module
+
+
+class Preload:
+    """
+    Manage state for setup/teardown of a preload module
 
     Parameters
     ----------
-    names: list of strings
-        Module names or file paths
-    parameter: object
-        Parameter passed to `dask_setup` and `dask_teardown`
-    argv: [string]
+    dask_server: dask.distributed.Server
+        The Worker or Scheduler
+    name: str
+        module name, file name, or web address to load
+    argv: [str]
         List of string arguments passed to click-configurable `dask_setup`.
-    file_dir: string
+    file_dir: str
         Path of a directory where files should be copied
     """
 
-    imported_modules = _import_modules(names, file_dir=file_dir)
+    dask_server: Server
+    name: str
+    argv: list[str]
+    file_dir: str | None
+    module: ModuleType
 
-    for name, interface in imported_modules.items():
-        dask_setup = interface.get("dask_setup", None)
-        dask_teardown = interface.get("dask_teardown", None)
+    def __init__(
+        self, dask_server: Server, name: str, argv: Iterable[str], file_dir: str | None
+    ):
+        self.dask_server = dask_server
+        self.name = name
+        self.argv = list(argv)
+        self.file_dir = file_dir
+
+        if is_webaddress(name):
+            self.module = _download_module(name)
+        else:
+            self.module = _import_module(name, file_dir)
+
+    async def start(self):
+        """Run when the server finishes its start method"""
+        dask_setup = getattr(self.module, "dask_setup", None)
 
         if dask_setup:
             if isinstance(dask_setup, click.Command):
                 context = dask_setup.make_context(
-                    "dask_setup", list(argv), allow_extra_args=False
+                    "dask_setup", self.argv, allow_extra_args=False
                 )
-                dask_setup.callback(parameter, *context.args, **context.params)
+                result = dask_setup.callback(
+                    self.dask_server, *context.args, **context.params
+                )
+                if inspect.isawaitable(result):
+                    await result
+                logger.info("Run preload setup click command: %s", self.name)
             else:
-                dask_setup(parameter)
-                logger.info("Run preload setup function: %s", name)
+                future = dask_setup(self.dask_server)
+                if inspect.isawaitable(future):
+                    await future
+                logger.info("Run preload setup function: %s", self.name)
 
-        if interface["dask_teardown"]:
-            atexit.register(interface["dask_teardown"], parameter)
+    async def teardown(self):
+        """Run when the server starts its close method"""
+        dask_teardown = getattr(self.module, "dask_teardown", None)
+        if dask_teardown:
+            future = dask_teardown(self.dask_server)
+            if inspect.isawaitable(future):
+                await future
+
+
+def process_preloads(
+    dask_server,
+    preload: str | list[str],
+    preload_argv: list[str] | list[list[str]],
+    *,
+    file_dir: str | None = None,
+) -> list[Preload]:
+    if isinstance(preload, str):
+        preload = [preload]
+    if preload_argv and isinstance(preload_argv[0], str):
+        preload_argv = [cast("list[str]", preload_argv)] * len(preload)
+    elif not preload_argv:
+        preload_argv = [cast("list[str]", [])] * len(preload)
+    if len(preload) != len(preload_argv):
+        raise ValueError(
+            "preload and preload_argv have mismatched lengths "
+            f"{len(preload)} != {len(preload_argv)}"
+        )
+
+    return [
+        Preload(dask_server, p, argv, file_dir)
+        for p, argv in zip(preload, preload_argv)
+    ]

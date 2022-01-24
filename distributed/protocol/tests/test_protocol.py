@@ -1,13 +1,17 @@
-from __future__ import print_function, division, absolute_import
-
-import sys
-
-import dask
 import pytest
 
-from distributed.protocol import loads, dumps, msgpack, maybe_compress, to_serialize
+from distributed.protocol import dumps, loads, maybe_compress, msgpack, to_serialize
 from distributed.protocol.compression import compressions
-from distributed.protocol.serialize import Serialize, Serialized, serialize, deserialize
+from distributed.protocol.cuda import cuda_deserialize, cuda_serialize
+from distributed.protocol.serialize import (
+    Serialize,
+    Serialized,
+    dask_deserialize,
+    dask_serialize,
+    deserialize,
+    serialize,
+)
+from distributed.system import MEMORY_LIMIT
 from distributed.utils import nbytes
 
 
@@ -30,8 +34,9 @@ def test_compression_2():
     pytest.importorskip("lz4")
     np = pytest.importorskip("numpy")
     x = np.random.random(10000)
-    header, payload = dumps(x.tobytes())
-    assert not header or not msgpack.loads(header, encoding="utf8").get("compression")
+    msg = dumps(to_serialize(x.tobytes()))
+    compression = msgpack.loads(msg[1]).get("compression")
+    assert all(c is None for c in compression)
 
 
 def test_compression_without_deserialization():
@@ -59,34 +64,25 @@ def test_small_and_big():
     # assert loads([big_header, big]) == {'y': d['y']}
 
 
-def test_maybe_compress():
-    pass
+@pytest.mark.parametrize(
+    "lib,compression",
+    [(None, None), ("zlib", "zlib"), ("lz4", "lz4"), ("zstandard", "zstd")],
+)
+def test_maybe_compress(lib, compression):
+    if lib:
+        pytest.importorskip(lib)
 
     try_converters = [bytes, memoryview]
-    try_compressions = ["zlib", "lz4"]
 
-    payload = b"123"
+    for f in try_converters:
+        payload = b"123"
+        assert maybe_compress(f(payload), compression=compression) == (None, payload)
 
-    with dask.config.set({"distributed.comm.compression": None}):
-        for f in try_converters:
-            assert maybe_compress(f(payload)) == (None, payload)
-
-    for compression in try_compressions:
-        try:
-            __import__(compression)
-        except ImportError:
-            continue
-
-        with dask.config.set({"distributed.comm.compression": compression}):
-            for f in try_converters:
-                payload = b"123"
-                assert maybe_compress(f(payload)) == (None, payload)
-
-                payload = b"0" * 10000
-                rc, rd = maybe_compress(f(payload))
-                # For some reason compressing memoryviews can force blosc...
-                assert rc in (compression, "blosc")
-                assert compressions[rc]["decompress"](rd) == payload
+        payload = b"0" * 10000
+        rc, rd = maybe_compress(f(payload), compression=compression)
+        # For some reason compressing memoryviews can force blosc...
+        assert rc in (compression, "blosc")
+        assert compressions[rc]["decompress"](rd) == payload
 
 
 def test_maybe_compress_sample():
@@ -100,25 +96,20 @@ def test_maybe_compress_sample():
 
 def test_large_bytes():
     for tp in (bytes, bytearray):
-        msg = {"x": tp(b"0" * 1000000), "y": 1}
+        msg = {"x": to_serialize(tp(b"0" * 1000000)), "y": 1}
         frames = dumps(msg)
+        msg["x"] = msg["x"].data
         assert loads(frames) == msg
         assert len(frames[0]) < 1000
         assert len(frames[1]) < 1000
-
-        assert loads(frames, deserialize=False) == msg
 
 
 @pytest.mark.slow
 def test_large_messages():
     np = pytest.importorskip("numpy")
-    psutil = pytest.importorskip("psutil")
     pytest.importorskip("lz4")
-    if psutil.virtual_memory().total < 8e9:
-        return
-
-    if sys.version_info.major == 2:
-        return 2
+    if MEMORY_LIMIT < 8e9:
+        pytest.skip("insufficient memory")
 
     x = np.random.randint(0, 255, size=200000000, dtype="u1")
 
@@ -136,9 +127,7 @@ def test_large_messages():
 
 
 def test_large_messages_map():
-    import psutil
-
-    if psutil.virtual_memory().total < 8e9:
+    if MEMORY_LIMIT < 8e9:
         pytest.skip("insufficient memory")
 
     x = {i: "mystring_%d" % i for i in range(100000)}
@@ -181,7 +170,9 @@ def test_loads_without_deserialization_avoids_compression():
 
 def eq_frames(a, b):
     if b"headers" in a:
-        return msgpack.loads(a, use_list=False) == msgpack.loads(b, use_list=False)
+        return msgpack.loads(a, use_list=False, strict_map_key=False) == msgpack.loads(
+            b, use_list=False, strict_map_key=False
+        )
     else:
         return a == b
 
@@ -222,7 +213,6 @@ def test_dumps_loads_Serialized():
     assert result == result3
 
 
-@pytest.mark.skipif(sys.version_info[0] < 3, reason="NumPy doesnt use memoryviews")
 def test_maybe_compress_memoryviews():
     np = pytest.importorskip("numpy")
     pytest.importorskip("lz4")
@@ -236,3 +226,30 @@ def test_maybe_compress_memoryviews():
     else:
         assert compression == "blosc"
         assert len(payload) < x.nbytes / 10
+
+
+@pytest.mark.parametrize("serializers", [("dask",), ("cuda",)])
+def test_preserve_header(serializers):
+    """
+    Test that a serialization family doesn't overwrite the headers
+    of the underlying registered dumps/loads functions.
+    """
+
+    class MyObj:
+        pass
+
+    @cuda_serialize.register(MyObj)
+    @dask_serialize.register(MyObj)
+    def _(x):
+        return {}, []
+
+    @cuda_deserialize.register(MyObj)
+    @dask_deserialize.register(MyObj)
+    def _(header, frames):
+        assert header == {}
+        assert frames == []
+        return MyObj()
+
+    header, frames = serialize(MyObj(), serializers=serializers)
+    o = deserialize(header, frames)
+    assert isinstance(o, MyObj)

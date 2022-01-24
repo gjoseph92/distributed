@@ -1,62 +1,64 @@
-from __future__ import print_function, division, absolute_import
+from __future__ import annotations
 
-import atexit
-from collections import deque
-from contextlib import contextmanager
-from datetime import timedelta
+import asyncio
+import contextvars
 import functools
-from hashlib import md5
+import importlib
 import inspect
 import json
 import logging
 import multiprocessing
-from numbers import Number
-import operator
 import os
+import pkgutil
 import re
-import shutil
 import socket
-from time import sleep
-from importlib import import_module
 import sys
 import tempfile
 import threading
 import warnings
 import weakref
-import pkgutil
-import six
-import tblib.pickling_support
+import xml.etree.ElementTree
+from asyncio import TimeoutError
+from collections import OrderedDict, UserDict, deque
+from concurrent.futures import CancelledError, ThreadPoolExecutor  # noqa: F401
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
+from hashlib import md5
+from importlib.util import cache_from_source
+from time import sleep
+from typing import Any as AnyType
+from typing import ClassVar, Container
 
-from .compatibility import cache_from_source, getargspec, invalidate_caches, reload
+import click
+import tblib.pickling_support
 
 try:
     import resource
 except ImportError:
-    resource = None
+    resource = None  # type: ignore
 
-import dask
-from dask import istask
-
-# provide format_bytes here for backwards compatibility
-from dask.utils import format_bytes  # noqa
-import toolz
-import tornado
+import tlz as toolz
 from tornado import gen
 from tornado.ioloop import IOLoop
 
-try:
-    from tornado.ioloop import PollIOLoop
-except ImportError:
-    PollIOLoop = None  # dropped in tornado 6.0
+import dask
+from dask import istask
+from dask.utils import parse_timedelta as _parse_timedelta
+from dask.widgets import get_template
 
-from .compatibility import PY3, PY2, get_thread_identity, unicode
+from .compatibility import PYPY, WINDOWS
 from .metrics import time
-
 
 try:
     from dask.context import thread_state
 except ImportError:
     thread_state = threading.local()
+
+# For some reason this is required in python >= 3.9
+if WINDOWS:
+    import multiprocessing.popen_spawn_win32
+else:
+    import multiprocessing.popen_spawn_posix
 
 logger = _logger = logging.getLogger(__name__)
 
@@ -65,31 +67,30 @@ no_default = "__no_default__"
 
 
 def _initialize_mp_context():
-    if PY3 and not sys.platform.startswith("win") and "PyPy" not in sys.version:
+    if WINDOWS or PYPY:
+        return multiprocessing
+    else:
         method = dask.config.get("distributed.worker.multiprocessing-method")
         ctx = multiprocessing.get_context(method)
         # Makes the test suite much faster
         preload = ["distributed"]
         if "pkg_resources" in sys.modules:
             preload.append("pkg_resources")
-        ctx.set_forkserver_preload(preload)
-    else:
-        ctx = multiprocessing
 
-    return ctx
+        from .versions import optional_packages, required_packages
+
+        for pkg, _ in required_packages + optional_packages:
+            try:
+                importlib.import_module(pkg)
+            except ImportError:
+                pass
+            else:
+                preload.append(pkg)
+        ctx.set_forkserver_preload(preload)
+        return ctx
 
 
 mp_context = _initialize_mp_context()
-
-
-def funcname(func):
-    """Get the name of a function."""
-    while hasattr(func, "func"):
-        func = func.func
-    try:
-        return func.__name__
-    except AttributeError:
-        return str(func)
 
 
 def has_arg(func, argname):
@@ -98,7 +99,7 @@ def has_arg(func, argname):
     """
     while True:
         try:
-            if argname in getargspec(func).args:
+            if argname in inspect.getfullargspec(func).args:
                 return True
         except TypeError:
             break
@@ -123,7 +124,7 @@ def get_fileno_limit():
 
 
 @toolz.memoize
-def _get_ip(host, port, family, default):
+def _get_ip(host, port, family):
     # By using a UDP socket, we don't actually try to connect but
     # simply select the local address through which *host* is reachable.
     sock = socket.socket(family, socket.SOCK_DGRAM)
@@ -131,14 +132,16 @@ def _get_ip(host, port, family, default):
         sock.connect((host, port))
         ip = sock.getsockname()[0]
         return ip
-    except EnvironmentError as e:
-        # XXX Should first try getaddrinfo() on socket.gethostname() and getfqdn()
+    except OSError as e:
         warnings.warn(
             "Couldn't detect a suitable IP address for "
-            "reaching %r, defaulting to %r: %s" % (host, default, e),
+            "reaching %r, defaulting to hostname: %s" % (host, e),
             RuntimeWarning,
         )
-        return default
+        addr_info = socket.getaddrinfo(
+            socket.gethostname(), port, family, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+        )[0]
+        return addr_info[4][0]
     finally:
         sock.close()
 
@@ -150,14 +153,14 @@ def get_ip(host="8.8.8.8", port=80):
     *host* defaults to a well-known Internet host (one of Google's public
     DNS servers).
     """
-    return _get_ip(host, port, family=socket.AF_INET, default="127.0.0.1")
+    return _get_ip(host, port, family=socket.AF_INET)
 
 
 def get_ipv6(host="2001:4860:4860::8888", port=80):
     """
     The same as get_ip(), but for IPv6.
     """
-    return _get_ip(host, port, family=socket.AF_INET6, default="::1")
+    return _get_ip(host, port, family=socket.AF_INET6)
 
 
 def get_ip_interface(ifname):
@@ -170,39 +173,23 @@ def get_ip_interface(ifname):
     """
     import psutil
 
-    for info in psutil.net_if_addrs()[ifname]:
+    net_if_addrs = psutil.net_if_addrs()
+
+    if ifname not in net_if_addrs:
+        allowed_ifnames = list(net_if_addrs.keys())
+        raise ValueError(
+            "{!r} is not a valid network interface. "
+            "Valid network interfaces are: {}".format(ifname, allowed_ifnames)
+        )
+
+    for info in net_if_addrs[ifname]:
         if info.family == socket.AF_INET:
             return info.address
-    raise ValueError("interface %r doesn't have an IPv4 address" % (ifname,))
+    raise ValueError(f"interface {ifname!r} doesn't have an IPv4 address")
 
 
-@contextmanager
-def ignoring(*exceptions):
-    try:
-        yield
-    except exceptions as e:
-        pass
-
-
-@gen.coroutine
-def ignore_exceptions(coroutines, *exceptions):
-    """ Process list of coroutines, ignoring certain exceptions
-
-    >>> coroutines = [cor(...) for ...]  # doctest: +SKIP
-    >>> x = yield ignore_exceptions(coroutines, TypeError)  # doctest: +SKIP
-    """
-    wait_iterator = gen.WaitIterator(*coroutines)
-    results = []
-    while not wait_iterator.done():
-        with ignoring(*exceptions):
-            result = yield wait_iterator.next()
-            results.append(result)
-    raise gen.Return(results)
-
-
-@gen.coroutine
-def All(args, quiet_exceptions=()):
-    """ Wait on many tasks at the same time
+async def All(args, quiet_exceptions=()):
+    """Wait on many tasks at the same time
 
     Err once any of the tasks err.
 
@@ -214,16 +201,16 @@ def All(args, quiet_exceptions=()):
     quiet_exceptions: tuple, Exception
         Exception types to avoid logging if they fail
     """
-    tasks = gen.WaitIterator(*args)
+    tasks = gen.WaitIterator(*map(asyncio.ensure_future, args))
     results = [None for _ in args]
     while not tasks.done():
         try:
-            result = yield tasks.next()
+            result = await tasks.next()
         except Exception:
 
             @gen.coroutine
             def quiet():
-                """ Watch unfinished tasks
+                """Watch unfinished tasks
 
                 Otherwise if they err they get logged in a way that is hard to
                 control.  They need some other task to watch them so that they
@@ -237,14 +224,12 @@ def All(args, quiet_exceptions=()):
 
             quiet()
             raise
-
         results[tasks.current_index] = result
-    raise gen.Return(results)
+    return results
 
 
-@gen.coroutine
-def Any(args, quiet_exceptions=()):
-    """ Wait on many tasks at the same time and return when any is finished
+async def Any(args, quiet_exceptions=()):
+    """Wait on many tasks at the same time and return when any is finished
 
     Err once any of the tasks err.
 
@@ -254,16 +239,16 @@ def Any(args, quiet_exceptions=()):
     quiet_exceptions: tuple, Exception
         Exception types to avoid logging if they fail
     """
-    tasks = gen.WaitIterator(*args)
+    tasks = gen.WaitIterator(*map(asyncio.ensure_future, args))
     results = [None for _ in args]
     while not tasks.done():
         try:
-            result = yield tasks.next()
+            result = await tasks.next()
         except Exception:
 
             @gen.coroutine
             def quiet():
-                """ Watch unfinished tasks
+                """Watch unfinished tasks
 
                 Otherwise if they err they get logged in a way that is hard to
                 control.  They need some other task to watch them so that they
@@ -280,61 +265,108 @@ def Any(args, quiet_exceptions=()):
 
         results[tasks.current_index] = result
         break
-    raise gen.Return(results)
+    return results
+
+
+class NoOpAwaitable:
+    """An awaitable object that always returns None.
+
+    Useful to return from a method that can be called in both asynchronous and
+    synchronous contexts"""
+
+    def __await__(self):
+        async def f():
+            return None
+
+        return f().__await__()
+
+
+class SyncMethodMixin:
+    """
+    A mixin for adding an `asynchronous` attribute and `sync` method to a class.
+
+    Subclasses must define a `loop` attribute for an associated
+    `tornado.IOLoop`, and may also add a `_asynchronous` attribute indicating
+    whether the class should default to asynchronous behavior.
+    """
+
+    @property
+    def asynchronous(self):
+        """Are we running in the event loop?"""
+        return in_async_call(self.loop, default=getattr(self, "_asynchronous", False))
+
+    def sync(self, func, *args, asynchronous=None, callback_timeout=None, **kwargs):
+        """Call `func` with `args` synchronously or asynchronously depending on
+        the calling context"""
+        callback_timeout = _parse_timedelta(callback_timeout)
+        if asynchronous is None:
+            asynchronous = self.asynchronous
+        if asynchronous:
+            future = func(*args, **kwargs)
+            if callback_timeout is not None:
+                future = asyncio.wait_for(future, callback_timeout)
+            return future
+        else:
+            return sync(
+                self.loop, func, *args, callback_timeout=callback_timeout, **kwargs
+            )
+
+
+def in_async_call(loop, default=False):
+    """Whether this call is currently within an async call"""
+    try:
+        return loop.asyncio_loop is asyncio.get_running_loop()
+    except RuntimeError:
+        # No *running* loop in thread. If the event loop isn't running, it
+        # _could_ be started later in this thread though. Return the default.
+        if not loop.asyncio_loop.is_running():
+            return default
+        return False
 
 
 def sync(loop, func, *args, callback_timeout=None, **kwargs):
     """
     Run coroutine in loop running in separate thread.
     """
-    # Tornado's PollIOLoop doesn't raise when using closed, do it ourselves
-    if PollIOLoop and (
-        (isinstance(loop, PollIOLoop) and getattr(loop, "_closing", False))
-        or (hasattr(loop, "asyncio_loop") and loop.asyncio_loop._closed)
-    ):
+    callback_timeout = _parse_timedelta(callback_timeout, "s")
+    if loop.asyncio_loop.is_closed():
         raise RuntimeError("IOLoop is closed")
-    try:
-        if loop.asyncio_loop.is_closed():  # tornado 6
-            raise RuntimeError("IOLoop is closed")
-    except AttributeError:
-        pass
 
     e = threading.Event()
-    main_tid = get_thread_identity()
+    main_tid = threading.get_ident()
     result = [None]
     error = [False]
 
     @gen.coroutine
     def f():
         try:
-            if main_tid == get_thread_identity():
+            if main_tid == threading.get_ident():
                 raise RuntimeError("sync() called from thread of running loop")
             yield gen.moment
-            thread_state.asynchronous = True
             future = func(*args, **kwargs)
             if callback_timeout is not None:
-                future = gen.with_timeout(timedelta(seconds=callback_timeout), future)
+                future = asyncio.wait_for(future, callback_timeout)
             result[0] = yield future
-        except Exception as exc:
+        except Exception:
             error[0] = sys.exc_info()
         finally:
-            thread_state.asynchronous = False
             e.set()
 
     loop.add_callback(f)
     if callback_timeout is not None:
         if not e.wait(callback_timeout):
-            raise gen.TimeoutError("timed out after %s s." % (callback_timeout,))
+            raise TimeoutError(f"timed out after {callback_timeout} s.")
     else:
         while not e.is_set():
             e.wait(10)
     if error[0]:
-        six.reraise(*error[0])
+        typ, exc, tb = error[0]
+        raise exc.with_traceback(tb)
     else:
         return result[0]
 
 
-class LoopRunner(object):
+class LoopRunner:
     """
     A helper to start and stop an IO loop in a controlled way.
     Several loop runners can associate safely to the same IO loop.
@@ -352,22 +384,21 @@ class LoopRunner(object):
     """
 
     # All loops currently associated to loop runners
-    _all_loops = weakref.WeakKeyDictionary()
+    _all_loops: ClassVar[
+        weakref.WeakKeyDictionary[IOLoop, tuple[int, LoopRunner | None]]
+    ] = weakref.WeakKeyDictionary()
     _lock = threading.Lock()
 
     def __init__(self, loop=None, asynchronous=False):
-        current = IOLoop.current()
         if loop is None:
             if asynchronous:
-                self._loop = current
+                self._loop = IOLoop.current()
             else:
                 # We're expecting the loop to run in another thread,
                 # avoid re-using this thread's assigned loop
                 self._loop = IOLoop()
-            self._should_close_loop = True
         else:
             self._loop = loop
-            self._should_close_loop = False
         self._asynchronous = asynchronous
         self._loop_thread = None
         self._started = False
@@ -407,8 +438,10 @@ class LoopRunner(object):
 
         def run_loop(loop=self._loop):
             loop.add_callback(loop_cb)
+            # run loop forever if it's not running already
             try:
-                loop.start()
+                if not loop.asyncio_loop.is_running():
+                    loop.start()
             except Exception as e:
                 start_exc[0] = e
             finally:
@@ -425,11 +458,13 @@ class LoopRunner(object):
         if actual_thread is not thread:
             # Loop already running in other thread (user-launched)
             done_evt.wait(5)
-            if not isinstance(start_exc[0], RuntimeError):
+            if start_exc[0] is not None and not isinstance(start_exc[0], RuntimeError):
                 if not isinstance(
                     start_exc[0], Exception
                 ):  # track down infrequent error
-                    raise TypeError("not an exception", start_exc[0])
+                    raise TypeError(
+                        f"not an exception: {start_exc[0]!r}",
+                    )
                 raise start_exc[0]
             self._all_loops[self._loop] = count + 1, None
         else:
@@ -466,7 +501,7 @@ class LoopRunner(object):
             try:
                 self._loop.add_callback(self._loop.stop)
                 self._loop_thread.join(timeout=timeout)
-                with ignoring(KeyError):  # IOLoop can be missing
+                with suppress(KeyError):  # IOLoop can be missing
                     self._loop.close()
             finally:
                 self._loop_thread = None
@@ -531,13 +566,8 @@ def tmp_text(filename, text):
             os.remove(fn)
 
 
-def clear_queue(q):
-    while not q.empty():
-        q.get_nowait()
-
-
 def is_kernel():
-    """ Determine if we're running within an IPython kernel
+    """Determine if we're running within an IPython kernel
 
     >>> is_kernel()
     False
@@ -554,6 +584,7 @@ def is_kernel():
 hex_pattern = re.compile("[a-f]+")
 
 
+@functools.lru_cache(100000)
 def key_split(s):
     """
     >>> key_split('x')
@@ -608,102 +639,38 @@ def key_split(s):
         return "Other"
 
 
-try:
-    from functools import lru_cache
-except ImportError:
-    lru_cache = False
-    pass
-else:
-    key_split = lru_cache(100000)(key_split)
+def key_split_group(x) -> str:
+    """A more fine-grained version of key_split
 
-if PY3:
-
-    def key_split_group(x):
-        """A more fine-grained version of key_split
-
-        >>> key_split_group('x')
-        'x'
-        >>> key_split_group('x-1')
-        'x-1'
-        >>> key_split_group('x-1-2-3')
-        'x-1-2-3'
-        >>> key_split_group(('x-2', 1))
-        'x-2'
-        >>> key_split_group("('x-2', 1)")
-        'x-2'
-        >>> key_split_group('hello-world-1')
-        'hello-world-1'
-        >>> key_split_group(b'hello-world-1')
-        'hello-world-1'
-        >>> key_split_group('ae05086432ca935f6eba409a8ecd4896')
-        'data'
-        >>> key_split_group('<module.submodule.myclass object at 0xdaf372')
-        'myclass'
-        >>> key_split_group(None)
-        'Other'
-        >>> key_split_group('x-abcdefab')  # ignores hex
-        'x-abcdefab'
-        """
-        typ = type(x)
-        if typ is tuple:
-            return x[0]
-        elif typ is str:
-            if x[0] == "(":
-                return x.split(",", 1)[0].strip("()\"'")
-            elif len(x) == 32 and re.match(r"[a-f0-9]{32}", x):
-                return "data"
-            elif x[0] == "<":
-                return x.strip("<>").split()[0].split(".")[-1]
-            else:
-                return x
-        elif typ is bytes:
-            return key_split_group(x.decode())
+    >>> key_split_group(('x-2', 1))
+    'x-2'
+    >>> key_split_group("('x-2', 1)")
+    'x-2'
+    >>> key_split_group('ae05086432ca935f6eba409a8ecd4896')
+    'data'
+    >>> key_split_group('<module.submodule.myclass object at 0xdaf372')
+    'myclass'
+    >>> key_split_group('x')
+    'x'
+    >>> key_split_group('x-1')
+    'x'
+    """
+    typ = type(x)
+    if typ is tuple:
+        return x[0]
+    elif typ is str:
+        if x[0] == "(":
+            return x.split(",", 1)[0].strip("()\"'")
+        elif len(x) == 32 and re.match(r"[a-f0-9]{32}", x):
+            return "data"
+        elif x[0] == "<":
+            return x.strip("<>").split()[0].split(".")[-1]
         else:
-            return "Other"
-
-
-else:
-
-    def key_split_group(x):
-        """A more fine-grained version of key_split
-
-        >>> key_split_group('x')
-        'x'
-        >>> key_split_group('x-1')
-        'x-1'
-        >>> key_split_group('x-1-2-3')
-        'x-1-2-3'
-        >>> key_split_group(('x-2', 1))
-        'x-2'
-        >>> key_split_group("('x-2', 1)")
-        'x-2'
-        >>> key_split_group('hello-world-1')
-        'hello-world-1'
-        >>> key_split_group(b'hello-world-1')
-        'hello-world-1'
-        >>> key_split_group('ae05086432ca935f6eba409a8ecd4896')
-        'data'
-        >>> key_split_group('<module.submodule.myclass object at 0xdaf372')
-        'myclass'
-        >>> key_split_group(None)
-        'Other'
-        >>> key_split_group('x-abcdefab')  # ignores hex
-        'x-abcdefab'
-        """
-        typ = type(x)
-        if typ is tuple:
-            return x[0]
-        elif typ is str or typ is unicode:
-            if x[0] == "(":
-                return x.split(",", 1)[0].strip("()\"'")
-            elif len(x) == 32 and re.match(r"[a-f0-9]{32}", x):
-                return "data"
-            elif x[0] == "<":
-                return x.strip("<>").split()[0].split(".")[-1]
-            else:
-                return x
-        else:
-            return "Other"
+            return key_split(x)
+    elif typ is bytes:
+        return key_split_group(x.decode())
+    else:
+        return "Other"
 
 
 @contextmanager
@@ -745,15 +712,20 @@ def silence_logging(level, root="distributed"):
 
 @toolz.memoize
 def ensure_ip(hostname):
-    """ Ensure that address is an IP address
+    """Ensure that address is an IP address
 
     Examples
     --------
     >>> ensure_ip('localhost')
     '127.0.0.1'
+    >>> ensure_ip('')  # Maps as localhost for binding e.g. 'tcp://:8811'
+    '127.0.0.1'
     >>> ensure_ip('123.123.123.123')  # pass through IP addresses
     '123.123.123.123'
     """
+    if not hostname:
+        hostname = "localhost"
+
     # Prefer IPv4 over IPv6, for compatibility
     families = [socket.AF_INET, socket.AF_INET6]
     for fam in families:
@@ -788,7 +760,7 @@ def get_traceback():
 
 
 def truncate_exception(e, n=10000):
-    """ Truncate exception to be about a certain length """
+    """Truncate exception to be about a certain length"""
     if len(str(e)) > n:
         try:
             return type(e)("Long error message", str(e)[:n])
@@ -798,36 +770,15 @@ def truncate_exception(e, n=10000):
         return e
 
 
-def tokey(o):
-    """ Convert an object to a string.
-
-    Examples
-    --------
-
-    >>> tokey(b'x')
-    'x'
-    >>> tokey('x')
-    'x'
-    >>> tokey(1)
-    '1'
-    """
-    typ = type(o)
-    if typ is unicode or typ is bytes:
-        return o
-    else:
-        return str(o)
-
-
 def validate_key(k):
-    """Validate a key as received on a stream.
-    """
+    """Validate a key as received on a stream."""
     typ = type(k)
-    if typ is not unicode and typ is not bytes:
-        raise TypeError("Unexpected key type %s (value: %r)" % (typ, k))
+    if typ is not str and typ is not bytes:
+        raise TypeError(f"Unexpected key type {typ} (value: {k!r})")
 
 
 def _maybe_complex(task):
-    """ Possibly contains a nested task """
+    """Possibly contains a nested task"""
     return (
         istask(task)
         or type(task) is list
@@ -837,27 +788,8 @@ def _maybe_complex(task):
     )
 
 
-def convert(task, dsk, extra_values):
-    if type(task) is list:
-        return [convert(v, dsk, extra_values) for v in task]
-    if type(task) is dict:
-        return {k: convert(v, dsk, extra_values) for k, v in task.items()}
-    if istask(task):
-        return (task[0],) + tuple(convert(x, dsk, extra_values) for x in task[1:])
-    try:
-        if task in dsk or task in extra_values:
-            return tokey(task)
-    except TypeError:
-        pass
-    return task
-
-
-def str_graph(dsk, extra_values=()):
-    return {tokey(k): convert(v, dsk, extra_values) for k, v in dsk.items()}
-
-
 def seek_delimiter(file, delimiter, blocksize):
-    """ Seek current file to next byte after a delimiter bytestring
+    """Seek current file to next byte after a delimiter bytestring
 
     This seeks the file to the next byte following the delimiter.  It does
     not return anything.  Use ``file.tell()`` to see location afterwards.
@@ -890,7 +822,7 @@ def seek_delimiter(file, delimiter, blocksize):
 
 
 def read_block(f, offset, length, delimiter=None):
-    """ Read a block of bytes from a file
+    """Read a block of bytes from a file
 
     Parameters
     ----------
@@ -941,28 +873,29 @@ def read_block(f, offset, length, delimiter=None):
     return bytes
 
 
-@contextmanager
-def tmpfile(extension=""):
-    extension = "." + extension.lstrip(".")
-    handle, filename = tempfile.mkstemp(extension)
-    os.close(handle)
-    os.remove(filename)
-
-    yield filename
-
-    if os.path.exists(filename):
-        try:
-            if os.path.isdir(filename):
-                shutil.rmtree(filename)
-            else:
-                os.remove(filename)
-        except OSError:  # sometimes we can't remove a generated temp file
-            pass
-
-
 def ensure_bytes(s):
-    """ Turn string or bytes to bytes
+    """Attempt to turn `s` into bytes.
 
+    Parameters
+    ----------
+    s : Any
+        The object to be converted. Will correctly handled
+
+        * str
+        * bytes
+        * objects implementing the buffer protocol (memoryview, ndarray, etc.)
+
+    Returns
+    -------
+    b : bytes
+
+    Raises
+    ------
+    TypeError
+        When `s` cannot be converted
+
+    Examples
+    --------
     >>> ensure_bytes('123')
     b'123'
     >>> ensure_bytes(b'123')
@@ -970,72 +903,19 @@ def ensure_bytes(s):
     """
     if isinstance(s, bytes):
         return s
-    if isinstance(s, memoryview):
-        return s.tobytes()
-    if isinstance(s, bytearray) or PY2 and isinstance(s, buffer):  # noqa: F821
-        return bytes(s)
-    if hasattr(s, "encode"):
+    elif hasattr(s, "encode"):
         return s.encode()
-    raise TypeError("Object %s is neither a bytes object nor has an encode method" % s)
-
-
-def divide_n_among_bins(n, bins):
-    """
-
-    >>> divide_n_among_bins(12, [1, 1])
-    [6, 6]
-    >>> divide_n_among_bins(12, [1, 2])
-    [4, 8]
-    >>> divide_n_among_bins(12, [1, 2, 1])
-    [3, 6, 3]
-    >>> divide_n_among_bins(11, [1, 2, 1])
-    [2, 6, 3]
-    >>> divide_n_among_bins(11, [.1, .2, .1])
-    [2, 6, 3]
-    """
-    total = sum(bins)
-    acc = 0.0
-    out = []
-    for b in bins:
-        now = n / total * b + acc
-        now, acc = divmod(now, 1)
-        out.append(int(now))
-    return out
-
-
-def mean(seq):
-    seq = list(seq)
-    return sum(seq) / len(seq)
-
-
-if hasattr(sys, "is_finalizing"):
-
-    def shutting_down(is_finalizing=sys.is_finalizing):
-        return is_finalizing()
-
-
-else:
-    _shutting_down = [False]
-
-    def _at_shutdown(l=_shutting_down):
-        l[0] = True
-
-    def shutting_down(l=_shutting_down):
-        return l[0]
-
-    atexit.register(_at_shutdown)
-
-
-shutting_down.__doc__ = """
-    Whether the interpreter is currently shutting down.
-    For use in finalizers, __del__ methods, and similar; it is advised
-    to early bind this function rather than look it up when calling it,
-    since at shutdown module globals may be cleared.
-    """
+    else:
+        try:
+            return bytes(s)
+        except Exception as e:
+            raise TypeError(
+                "Object %s is neither a bytes object nor has an encode method" % s
+            ) from e
 
 
 def open_port(host=""):
-    """ Return a probably-open port
+    """Return a probably-open port
 
     There is a chance that this port will be taken by the operating system soon
     after returning from this function.
@@ -1050,7 +930,7 @@ def open_port(host=""):
 
 
 def import_file(path):
-    """ Loads modules for a file (.py, .zip, .egg) """
+    """Loads modules for a file (.py, .zip, .egg)"""
     directory, filename = os.path.split(path)
     name, ext = os.path.splitext(filename)
     names_to_import = []
@@ -1062,184 +942,29 @@ def import_file(path):
         names_to_import.append(name)
     if ext == ".py":  # Ensure that no pyc file will be reused
         cache_file = cache_from_source(path)
-        with ignoring(OSError):
+        with suppress(OSError):
             os.remove(cache_file)
     if ext in (".egg", ".zip", ".pyz"):
         if path not in sys.path:
             sys.path.insert(0, path)
-        if sys.version_info >= (3, 6):
-            names = (mod_info.name for mod_info in pkgutil.iter_modules([path]))
-        else:
-            names = (mod_info[1] for mod_info in pkgutil.iter_modules([path]))
+        names = (mod_info.name for mod_info in pkgutil.iter_modules([path]))
         names_to_import.extend(names)
 
     loaded = []
     if not names_to_import:
         logger.warning("Found nothing to import from %s", filename)
     else:
-        invalidate_caches()
+        importlib.invalidate_caches()
         if tmp_python_path is not None:
             sys.path.insert(0, tmp_python_path)
         try:
             for name in names_to_import:
                 logger.info("Reload module %s from %s file", name, ext)
-                loaded.append(reload(import_module(name)))
+                loaded.append(importlib.reload(importlib.import_module(name)))
         finally:
             if tmp_python_path is not None:
                 sys.path.remove(tmp_python_path)
     return loaded
-
-
-class itemgetter(object):
-    """A picklable itemgetter.
-
-    Examples
-    --------
-    >>> data = [0, 1, 2]
-    >>> get_1 = itemgetter(1)
-    >>> get_1(data)
-    1
-    """
-
-    __slots__ = ("index",)
-
-    def __init__(self, index):
-        self.index = index
-
-    def __call__(self, x):
-        return x[self.index]
-
-    def __reduce__(self):
-        return (itemgetter, (self.index,))
-
-
-byte_sizes = {
-    "kB": 10 ** 3,
-    "MB": 10 ** 6,
-    "GB": 10 ** 9,
-    "TB": 10 ** 12,
-    "PB": 10 ** 15,
-    "KiB": 2 ** 10,
-    "MiB": 2 ** 20,
-    "GiB": 2 ** 30,
-    "TiB": 2 ** 40,
-    "PiB": 2 ** 50,
-    "B": 1,
-    "": 1,
-}
-byte_sizes = {k.lower(): v for k, v in byte_sizes.items()}
-byte_sizes.update({k[0]: v for k, v in byte_sizes.items() if k and "i" not in k})
-byte_sizes.update({k[:-1]: v for k, v in byte_sizes.items() if k and "i" in k})
-
-
-def parse_bytes(s):
-    """ Parse byte string to numbers
-
-    >>> parse_bytes('100')
-    100
-    >>> parse_bytes('100 MB')
-    100000000
-    >>> parse_bytes('100M')
-    100000000
-    >>> parse_bytes('5kB')
-    5000
-    >>> parse_bytes('5.4 kB')
-    5400
-    >>> parse_bytes('1kiB')
-    1024
-    >>> parse_bytes('1e6')
-    1000000
-    >>> parse_bytes('1e6 kB')
-    1000000000
-    >>> parse_bytes('MB')
-    1000000
-    """
-    if isinstance(s, (int, float)):
-        return int(s)
-    s = s.replace(" ", "")
-    if not s[0].isdigit():
-        s = "1" + s
-
-    for i in range(len(s) - 1, -1, -1):
-        if not s[i].isalpha():
-            break
-    index = i + 1
-
-    prefix = s[:index]
-    suffix = s[index:]
-
-    n = float(prefix)
-
-    multiplier = byte_sizes[suffix.lower()]
-
-    result = n * multiplier
-    return int(result)
-
-
-timedelta_sizes = {
-    "s": 1,
-    "ms": 1e-3,
-    "us": 1e-6,
-    "ns": 1e-9,
-    "m": 60,
-    "h": 3600,
-    "d": 3600 * 24,
-}
-
-tds2 = {
-    "second": 1,
-    "minute": 60,
-    "hour": 60 * 60,
-    "day": 60 * 60 * 24,
-    "millisecond": 1e-3,
-    "microsecond": 1e-6,
-    "nanosecond": 1e-9,
-}
-tds2.update({k + "s": v for k, v in tds2.items()})
-timedelta_sizes.update(tds2)
-timedelta_sizes.update({k.upper(): v for k, v in timedelta_sizes.items()})
-
-
-def parse_timedelta(s, default="seconds"):
-    """ Parse timedelta string to number of seconds
-
-    Examples
-    --------
-    >>> parse_timedelta('3s')
-    3
-    >>> parse_timedelta('3.5 seconds')
-    3.5
-    >>> parse_timedelta('300ms')
-    0.3
-    >>> parse_timedelta(timedelta(seconds=3))  # also supports timedeltas
-    3
-    """
-    if s is None:
-        return None
-    if isinstance(s, timedelta):
-        return s.total_seconds()
-    if isinstance(s, Number):
-        s = str(s)
-    s = s.replace(" ", "")
-    if not s[0].isdigit():
-        s = "1" + s
-
-    for i in range(len(s) - 1, -1, -1):
-        if not s[i].isalpha():
-            break
-    index = i + 1
-
-    prefix = s[:index]
-    suffix = s[index:] or default
-
-    n = float(prefix)
-
-    multiplier = timedelta_sizes[suffix.lower()]
-
-    result = n * multiplier
-    if int(result) == result:
-        result = int(result)
-    return result
 
 
 def asciitable(columns, rows):
@@ -1263,56 +988,19 @@ def asciitable(columns, rows):
     return "\n".join([bar, header, bar, data, bar])
 
 
-if PY2:
-
-    def nbytes(frame, _bytes_like=(bytes, bytearray, buffer)):  # noqa: F821
-        """ Number of bytes of a frame or memoryview """
-        if isinstance(frame, _bytes_like):
-            return len(frame)
-        elif isinstance(frame, memoryview):
-            if frame.shape is None:
-                return frame.itemsize
-            else:
-                return functools.reduce(operator.mul, frame.shape, frame.itemsize)
-        else:
-            return frame.nbytes
-
-
-else:
-
-    def nbytes(frame, _bytes_like=(bytes, bytearray)):
-        """ Number of bytes of a frame or memoryview """
-        if isinstance(frame, _bytes_like):
-            return len(frame)
-        else:
-            try:
-                return frame.nbytes
-            except AttributeError:
-                return len(frame)
-
-
-def PeriodicCallback(callback, callback_time, io_loop=None):
-    """
-    Wrapper around tornado.IOLoop.PeriodicCallback, for compatibility
-    with removal of the `io_loop` parameter in Tornado 5.0.
-    """
-    if tornado.version_info >= (5,):
-        return tornado.ioloop.PeriodicCallback(callback, callback_time)
+def nbytes(frame, _bytes_like=(bytes, bytearray)):
+    """Number of bytes of a frame or memoryview"""
+    if isinstance(frame, _bytes_like):
+        return len(frame)
     else:
-        return tornado.ioloop.PeriodicCallback(callback, callback_time, io_loop)
-
-
-@contextmanager
-def time_warn(duration, text):
-    start = time()
-    yield
-    end = time()
-    if end - start > duration:
-        print("TIME WARNING", text, end - start)
+        try:
+            return frame.nbytes
+        except AttributeError:
+            return len(frame)
 
 
 def json_load_robust(fn, load=json.load):
-    """ Reads a JSON file from disk that may be being written as we read """
+    """Reads a JSON file from disk that may be being written as we read"""
     while not os.path.exists(fn):
         sleep(0.01)
     for i in range(10):
@@ -1326,33 +1014,14 @@ def json_load_robust(fn, load=json.load):
         sleep(0.1)
 
 
-def format_time(n):
-    """ format integers as time
-
-    >>> format_time(1)
-    '1.00 s'
-    >>> format_time(0.001234)
-    '1.23 ms'
-    >>> format_time(0.00012345)
-    '123.45 us'
-    >>> format_time(123.456)
-    '123.46 s'
-    """
-    if n >= 1:
-        return "%.2f s" % n
-    if n >= 1e-3:
-        return "%.2f ms" % (n * 1e3)
-    return "%.2f us" % (n * 1e6)
-
-
 class DequeHandler(logging.Handler):
-    """ A logging.Handler that records records into a deque """
+    """A logging.Handler that records records into a deque"""
 
-    _instances = weakref.WeakSet()
+    _instances: ClassVar[weakref.WeakSet[DequeHandler]] = weakref.WeakSet()
 
     def __init__(self, *args, n=10000, **kwargs):
         self.deque = deque(maxlen=n)
-        super(DequeHandler, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._instances.add(self)
 
     def emit(self, record):
@@ -1374,7 +1043,7 @@ class DequeHandler(logging.Handler):
 
 
 def reset_logger_locks():
-    """ Python 2's logger's locks don't survive a fork event
+    """Python 2's logger's locks don't survive a fork event
 
     https://github.com/dask/distributed/issues/1491
     """
@@ -1383,40 +1052,33 @@ def reset_logger_locks():
             handler.createLock()
 
 
-# Only bother if asyncio has been loaded by Tornado
-if "asyncio" in sys.modules and tornado.version_info[0] >= 5:
-
-    jupyter_event_loop_initialized = False
-
-    if "notebook" in sys.modules:
-        import traitlets
-        from notebook.notebookapp import NotebookApp
-
-        jupyter_event_loop_initialized = traitlets.config.Application.initialized() and isinstance(
-            traitlets.config.Application.instance(), NotebookApp
-        )
-
-    if not jupyter_event_loop_initialized:
-        import asyncio
-        import tornado.platform.asyncio
-
-        asyncio.set_event_loop_policy(
-            tornado.platform.asyncio.AnyThreadEventLoopPolicy()
-        )
-
-
+@functools.lru_cache(1000)
 def has_keyword(func, keyword):
-    if PY3:
-        return keyword in inspect.signature(func).parameters
-    else:
-        # https://stackoverflow.com/questions/50100498/determine-keywords-of-a-tornado-coroutine
-        if gen.is_coroutine_function(func):
-            func = func.__wrapped__
-        return keyword in inspect.getargspec(func).args
+    return keyword in inspect.signature(func).parameters
 
 
-if lru_cache:
-    has_keyword = lru_cache(1000)(has_keyword)
+@functools.lru_cache(1000)
+def command_has_keyword(cmd, k):
+    if cmd is not None:
+        if isinstance(cmd, str):
+            try:
+                from importlib import import_module
+
+                cmd = import_module(cmd)
+            except ImportError:
+                raise ImportError("Module for command %s is not available" % cmd)
+
+        if isinstance(getattr(cmd, "main"), click.core.Command):
+            cmd = cmd.main
+        if isinstance(cmd, click.core.Command):
+            cmd_params = {
+                p.human_readable_name
+                for p in cmd.params
+                if isinstance(p, click.core.Option)
+            }
+            return k in cmd_params
+
+    return False
 
 
 # from bokeh.palettes import viridis
@@ -1450,12 +1112,25 @@ def color_of(x, palette=palette):
     return palette[n % len(palette)]
 
 
+def _iscoroutinefunction(f):
+    # Python < 3.8 does not support determining if `partial` objects wrap async funcs
+    if sys.version_info < (3, 8):
+        while isinstance(f, functools.partial):
+            f = f.func
+    return inspect.iscoroutinefunction(f) or gen.is_coroutine_function(f)
+
+
+@functools.lru_cache(None)
+def _iscoroutinefunction_cached(f):
+    return _iscoroutinefunction(f)
+
+
 def iscoroutinefunction(f):
-    if gen.is_coroutine_function(f):
-        return True
-    if sys.version_info >= (3, 5) and inspect.iscoroutinefunction(f):
-        return True
-    return False
+    # Attempt to use lru_cache version and fall back to non-cached version if needed
+    try:
+        return _iscoroutinefunction_cached(f)
+    except TypeError:  # unhashable type
+        return _iscoroutinefunction(f)
 
 
 @contextmanager
@@ -1463,23 +1138,8 @@ def warn_on_duration(duration, msg):
     start = time()
     yield
     stop = time()
-    if stop - start > parse_timedelta(duration):
+    if stop - start > _parse_timedelta(duration):
         warnings.warn(msg, stacklevel=2)
-
-
-def typename(typ):
-    """ Return name of type
-
-    Examples
-    --------
-    >>> from distributed import Scheduler
-    >>> typename(Scheduler)
-    'distributed.scheduler.Scheduler'
-    """
-    try:
-        return typ.__module__ + "." + typ.__name__
-    except AttributeError:
-        return str(typ)
 
 
 def format_dashboard_link(host, port):
@@ -1488,4 +1148,344 @@ def format_dashboard_link(host, port):
         scheme = "https"
     else:
         scheme = "http"
-    return template.format(scheme=scheme, host=host, port=port, **os.environ)
+    return template.format(
+        **toolz.merge(os.environ, dict(scheme=scheme, host=host, port=port))
+    )
+
+
+def parse_ports(port):
+    """Parse input port information into list of ports
+
+    Parameters
+    ----------
+    port : int, str, None
+        Input port or ports. Can be an integer like 8787, a string for a
+        single port like "8787", a string for a sequential range of ports like
+        "8000:8200", or None.
+
+    Returns
+    -------
+    ports : list
+        List of ports
+
+    Examples
+    --------
+    A single port can be specified using an integer:
+
+    >>> parse_ports(8787)
+    [8787]
+
+    or a string:
+
+    >>> parse_ports("8787")
+    [8787]
+
+    A sequential range of ports can be specified by a string which indicates
+    the first and last ports which should be included in the sequence of ports:
+
+    >>> parse_ports("8787:8790")
+    [8787, 8788, 8789, 8790]
+
+    An input of ``None`` is also valid and can be used to indicate that no port
+    has been specified:
+
+    >>> parse_ports(None)
+    [None]
+
+    """
+    if isinstance(port, str) and ":" not in port:
+        port = int(port)
+
+    if isinstance(port, (int, type(None))):
+        ports = [port]
+    else:
+        port_start, port_stop = map(int, port.split(":"))
+        if port_stop <= port_start:
+            raise ValueError(
+                "When specifying a range of ports like port_start:port_stop, "
+                "port_stop must be greater than port_start, but got "
+                f"port_start={port_start} and port_stop={port_stop}"
+            )
+        ports = list(range(port_start, port_stop + 1))
+
+    return ports
+
+
+is_coroutine_function = iscoroutinefunction
+
+
+class Log(str):
+    """A container for newline-delimited string of log entries"""
+
+    def _repr_html_(self):
+        return get_template("log.html.j2").render(log=self)
+
+
+class Logs(dict):
+    """A container for a dict mapping names to strings of log entries"""
+
+    def _repr_html_(self):
+        return get_template("logs.html.j2").render(logs=self)
+
+
+def cli_keywords(d: dict, cls=None, cmd=None):
+    """Convert a kwargs dictionary into a list of CLI keywords
+
+    Parameters
+    ----------
+    d : dict
+        The keywords to convert
+    cls : callable
+        The callable that consumes these terms to check them for validity
+    cmd : string or object
+        A string with the name of a module, or the module containing a
+        click-generated command with a "main" function, or the function itself.
+        It may be used to parse a module's custom arguments (i.e., arguments that
+        are not part of Worker class), such as nprocs from dask-worker CLI or
+        enable_nvlink from dask-cuda-worker CLI.
+
+    Examples
+    --------
+    >>> cli_keywords({"x": 123, "save_file": "foo.txt"})
+    ['--x', '123', '--save-file', 'foo.txt']
+
+    >>> from dask.distributed import Worker
+    >>> cli_keywords({"x": 123}, Worker)
+    Traceback (most recent call last):
+    ...
+    ValueError: Class distributed.worker.Worker does not support keyword x
+    """
+    from dask.utils import typename
+
+    if cls or cmd:
+        for k in d:
+            if not has_keyword(cls, k) and not command_has_keyword(cmd, k):
+                if cls and cmd:
+                    raise ValueError(
+                        "Neither class %s or module %s support keyword %s"
+                        % (typename(cls), typename(cmd), k)
+                    )
+                elif cls:
+                    raise ValueError(
+                        f"Class {typename(cls)} does not support keyword {k}"
+                    )
+                else:
+                    raise ValueError(
+                        f"Module {typename(cmd)} does not support keyword {k}"
+                    )
+
+    def convert_value(v):
+        out = str(v)
+        if " " in out and "'" not in out and '"' not in out:
+            out = '"' + out + '"'
+        return out
+
+    return sum(
+        (["--" + k.replace("_", "-"), convert_value(v)] for k, v in d.items()), []
+    )
+
+
+def is_valid_xml(text):
+    return xml.etree.ElementTree.fromstring(text) is not None
+
+
+_offload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="Dask-Offload")
+weakref.finalize(_offload_executor, _offload_executor.shutdown)
+
+
+def import_term(name: str):
+    """Return the fully qualified term
+
+    Examples
+    --------
+    >>> import_term("math.sin") # doctest: +SKIP
+    <function math.sin(x, /)>
+    """
+    try:
+        module_name, attr_name = name.rsplit(".", 1)
+    except ValueError:
+        return importlib.import_module(name)
+
+    module = importlib.import_module(module_name)
+    return getattr(module, attr_name)
+
+
+async def offload(fn, *args, **kwargs):
+    loop = asyncio.get_event_loop()
+    # Retain context vars while deserializing; see https://bugs.python.org/issue34014
+    context = contextvars.copy_context()
+    return await loop.run_in_executor(
+        _offload_executor, lambda: context.run(fn, *args, **kwargs)
+    )
+
+
+class EmptyContext:
+    def __enter__(self):
+        pass
+
+    def __exit__(self, *args):
+        pass
+
+    async def __aenter__(self):
+        pass
+
+    async def __aexit__(self, *args):
+        pass
+
+
+empty_context = EmptyContext()
+
+
+class LRU(UserDict):
+    """Limited size mapping, evicting the least recently looked-up key when full"""
+
+    def __init__(self, maxsize):
+        super().__init__()
+        self.data = OrderedDict()
+        self.maxsize = maxsize
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.data.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value):
+        if len(self) >= self.maxsize:
+            self.data.popitem(last=False)
+        super().__setitem__(key, value)
+
+
+def clean_dashboard_address(addrs: AnyType, default_listen_ip: str = "") -> list[dict]:
+    """
+    Examples
+    --------
+    >>> clean_dashboard_address(8787)
+    [{'address': '', 'port': 8787}]
+    >>> clean_dashboard_address(":8787")
+    [{'address': '', 'port': 8787}]
+    >>> clean_dashboard_address("8787")
+    [{'address': '', 'port': 8787}]
+    >>> clean_dashboard_address("8787")
+    [{'address': '', 'port': 8787}]
+    >>> clean_dashboard_address("foo:8787")
+    [{'address': 'foo', 'port': 8787}]
+    >>> clean_dashboard_address([8787, 8887])
+    [{'address': '', 'port': 8787}, {'address': '', 'port': 8887}]
+    >>> clean_dashboard_address(":8787,:8887")
+    [{'address': '', 'port': 8787}, {'address': '', 'port': 8887}]
+    """
+
+    if default_listen_ip == "0.0.0.0":
+        default_listen_ip = ""  # for IPV6
+
+    if isinstance(addrs, str):
+        addrs = addrs.split(",")
+    if not isinstance(addrs, list):
+        addrs = [addrs]
+
+    addresses = []
+    for addr in addrs:
+        try:
+            addr = int(addr)
+        except (TypeError, ValueError):
+            pass
+
+        if isinstance(addr, str):
+            addr = addr.split(":")
+
+        if isinstance(addr, (tuple, list)):
+            if len(addr) == 2:
+                host, port = (addr[0], int(addr[1]))
+            elif len(addr) == 1:
+                [host], port = addr, 0
+            else:
+                raise ValueError(addr)
+        elif isinstance(addr, int):
+            host = default_listen_ip
+            port = addr
+
+        addresses.append({"address": host, "port": port})
+    return addresses
+
+
+_deprecations = {
+    "deserialize_for_cli": "dask.config.deserialize",
+    "serialize_for_cli": "dask.config.serialize",
+    "format_bytes": "dask.utils.format_bytes",
+    "format_time": "dask.utils.format_time",
+    "funcname": "dask.utils.funcname",
+    "parse_bytes": "dask.utils.parse_bytes",
+    "parse_timedelta": "dask.utils.parse_timedelta",
+    "typename": "dask.utils.typename",
+    "tmpfile": "dask.utils.tmpfile",
+}
+
+
+def __getattr__(name):
+    if name in _deprecations:
+        use_instead = _deprecations[name]
+
+        warnings.warn(
+            f"{name} is deprecated and will be removed in a future release. "
+            f"Please use {use_instead} instead.",
+            category=FutureWarning,
+            stacklevel=2,
+        )
+        return import_term(use_instead)
+    else:
+        raise AttributeError(f"module {__name__} has no attribute {name}")
+
+
+# Used internally by recursive_to_dict to stop infinite recursion. If an object has
+# already been encountered, a string representation will be returned instead. This is
+# necessary since we have multiple cyclic referencing data structures.
+_recursive_to_dict_seen: ContextVar[set[int]] = ContextVar("_recursive_to_dict_seen")
+
+
+def recursive_to_dict(obj: AnyType, *, exclude: Container[str] = ()) -> AnyType:
+    """Recursively convert arbitrary Python objects to a JSON-serializable
+    representation. This is intended for debugging purposes only and calls ``_to_dict``
+    methods on encountered objects, if available.
+
+    Parameters
+    ----------
+    exclude:
+        A list of attribute names to be excluded from the dump.
+        This will be forwarded to the objects ``_to_dict`` methods and these methods
+        are required to accept this parameter.
+    """
+    if isinstance(obj, (int, float, bool, str)) or obj is None:
+        return obj
+    if isinstance(obj, (type, bytes)):
+        return repr(obj)
+
+    # Prevent infinite recursion
+    try:
+        seen = _recursive_to_dict_seen.get()
+    except LookupError:
+        seen = set()
+    seen = seen.copy()
+    tok = _recursive_to_dict_seen.set(seen)
+    try:
+        if id(obj) in seen:
+            return repr(obj)
+        seen.add(id(obj))
+
+        if hasattr(obj, "_to_dict"):
+            return obj._to_dict(exclude=exclude)
+        if isinstance(obj, (list, tuple, set, frozenset, deque)):
+            return [recursive_to_dict(el, exclude=exclude) for el in obj]
+        if isinstance(obj, dict):
+            res = {}
+            for k, v in obj.items():
+                k = recursive_to_dict(k, exclude=exclude)
+                v = recursive_to_dict(v, exclude=exclude)
+                try:
+                    res[k] = v
+                except TypeError:
+                    res[str(k)] = v
+            return res
+
+        return repr(obj)
+    finally:
+        tok.var.reset(tok)

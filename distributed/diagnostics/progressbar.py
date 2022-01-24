@@ -1,22 +1,20 @@
-from __future__ import print_function, division, absolute_import
-
+import html
 import logging
-from timeit import default_timer
 import sys
 import weakref
+from contextlib import suppress
+from timeit import default_timer
 
-from toolz import valmap
-from tornado import gen
+from tlz import valmap
 from tornado.ioloop import IOLoop
 
-from .progress import format_time, Progress, MultiProgress
+import dask
 
-from ..compatibility import html_escape
-from ..core import connect, coerce_to_address, CommClosedError
 from ..client import default_client, futures_of
+from ..core import CommClosedError, clean_exception, coerce_to_address, connect
 from ..protocol.pickle import dumps
-from ..utils import ignoring, key_split, is_kernel, LoopRunner, parse_timedelta
-
+from ..utils import LoopRunner, is_kernel, key_split
+from .progress import MultiProgress, Progress, format_time
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +25,7 @@ def get_scheduler(scheduler):
     return coerce_to_address(scheduler)
 
 
-class ProgressBar(object):
+class ProgressBar:
     def __init__(self, keys, scheduler=None, interval="100ms", complete=True):
         self.scheduler = get_scheduler(scheduler)
 
@@ -38,7 +36,7 @@ class ProgressBar(object):
                 break
 
         self.keys = {k.key if hasattr(k, "key") else k for k in keys}
-        self.interval = parse_timedelta(interval, default="s")
+        self.interval = dask.utils.parse_timedelta(interval, default="s")
         self.complete = complete
         self._start_time = default_timer()
 
@@ -46,16 +44,14 @@ class ProgressBar(object):
     def elapsed(self):
         return default_timer() - self._start_time
 
-    @gen.coroutine
-    def listen(self):
+    async def listen(self):
         complete = self.complete
         keys = self.keys
 
-        @gen.coroutine
-        def setup(scheduler):
+        async def setup(scheduler):
             p = Progress(keys, scheduler, complete=complete)
-            yield p.setup()
-            raise gen.Return(p)
+            await p.setup()
+            return p
 
         def function(scheduler, p):
             result = {
@@ -67,13 +63,12 @@ class ProgressBar(object):
                 result.update(p.extra)
             return result
 
-        self.comm = yield connect(
-            self.scheduler,
-            connection_args=self.client().connection_args if self.client else None,
+        self.comm = await connect(
+            self.scheduler, **(self.client().connection_args if self.client else {})
         )
         logger.debug("Progressbar Connected to scheduler")
 
-        yield self.comm.write(
+        await self.comm.write(
             {
                 "op": "feed",
                 "setup": dumps(setup),
@@ -85,7 +80,7 @@ class ProgressBar(object):
 
         while True:
             try:
-                response = yield self.comm.read(
+                response = await self.comm.read(
                     deserializers=self.client()._deserializers if self.client else None
                 )
             except CommClosedError:
@@ -94,7 +89,7 @@ class ProgressBar(object):
             self.status = response["status"]
             self._draw_bar(**response)
             if response["status"] in ("error", "finished"):
-                yield self.comm.close()
+                await self.comm.close()
                 self._draw_stop(**response)
                 break
 
@@ -104,7 +99,7 @@ class ProgressBar(object):
         pass
 
     def __del__(self):
-        with ignoring(AttributeError):
+        with suppress(AttributeError):
             self.comm.abort()
 
 
@@ -118,9 +113,9 @@ class TextProgressBar(ProgressBar):
         loop=None,
         complete=True,
         start=True,
-        **kwargs
+        **kwargs,
     ):
-        super(TextProgressBar, self).__init__(keys, scheduler, interval, complete)
+        super().__init__(keys, scheduler, interval, complete)
         self.width = width
         self.loop = loop or IOLoop()
 
@@ -136,7 +131,7 @@ class TextProgressBar(ProgressBar):
         msg = "\r[{0:<{1}}] | {2}% Completed | {3}".format(
             bar, self.width, percent, elapsed
         )
-        with ignoring(ValueError):
+        with suppress(ValueError):
             sys.stdout.write(msg)
             sys.stdout.flush()
 
@@ -146,7 +141,7 @@ class TextProgressBar(ProgressBar):
 
 
 class ProgressWidget(ProgressBar):
-    """ ProgressBar that uses an IPython ProgressBar widget for the notebook
+    """ProgressBar that uses an IPython ProgressBar widget for the notebook
 
     See Also
     --------
@@ -161,11 +156,11 @@ class ProgressWidget(ProgressBar):
         interval="100ms",
         complete=False,
         loop=None,
-        **kwargs
+        **kwargs,
     ):
-        super(ProgressWidget, self).__init__(keys, scheduler, interval, complete)
+        super().__init__(keys, scheduler, interval, complete)
 
-        from ipywidgets import FloatProgress, HBox, VBox, HTML
+        from ipywidgets import HTML, FloatProgress, HBox, VBox
 
         self.elapsed_time = HTML("")
         self.bar = FloatProgress(min=0, max=1, description="")
@@ -180,6 +175,7 @@ class ProgressWidget(ProgressBar):
 
     def _draw_stop(self, remaining, status, exception=None, **kwargs):
         if status == "error":
+            _, exception, _ = clean_exception(exception)
             self.bar.bar_style = "danger"
             self.elapsed_time.value = (
                 '<div style="padding: 0px 10px 5px 10px"><b>Exception</b> '
@@ -212,7 +208,7 @@ class ProgressWidget(ProgressBar):
         )
 
 
-class MultiProgressBar(object):
+class MultiProgressBar:
     def __init__(
         self,
         keys,
@@ -220,7 +216,7 @@ class MultiProgressBar(object):
         func=key_split,
         interval="100ms",
         complete=False,
-        **kwargs
+        **kwargs,
     ):
         self.scheduler = get_scheduler(scheduler)
 
@@ -240,17 +236,15 @@ class MultiProgressBar(object):
     def elapsed(self):
         return default_timer() - self._start_time
 
-    @gen.coroutine
-    def listen(self):
+    async def listen(self):
         complete = self.complete
         keys = self.keys
         func = self.func
 
-        @gen.coroutine
-        def setup(scheduler):
+        async def setup(scheduler):
             p = MultiProgress(keys, scheduler, complete=complete, func=func)
-            yield p.setup()
-            raise gen.Return(p)
+            await p.setup()
+            return p
 
         def function(scheduler, p):
             result = {
@@ -262,13 +256,12 @@ class MultiProgressBar(object):
                 result.update(p.extra)
             return result
 
-        self.comm = yield connect(
-            self.scheduler,
-            connection_args=self.client().connection_args if self.client else None,
+        self.comm = await connect(
+            self.scheduler, **(self.client().connection_args if self.client else {})
         )
         logger.debug("Progressbar Connected to scheduler")
 
-        yield self.comm.write(
+        await self.comm.write(
             {
                 "op": "feed",
                 "setup": dumps(setup),
@@ -278,14 +271,14 @@ class MultiProgressBar(object):
         )
 
         while True:
-            response = yield self.comm.read(
+            response = await self.comm.read(
                 deserializers=self.client()._deserializers if self.client else None
             )
             self._last_response = response
             self.status = response["status"]
             self._draw_bar(**response)
             if response["status"] in ("error", "finished"):
-                yield self.comm.close()
+                await self.comm.close()
                 self._draw_stop(**response)
                 break
         logger.debug("Progressbar disconnected from scheduler")
@@ -294,12 +287,12 @@ class MultiProgressBar(object):
         pass
 
     def __del__(self):
-        with ignoring(AttributeError):
+        with suppress(AttributeError):
             self.comm.abort()
 
 
 class MultiProgressWidget(MultiProgressBar):
-    """ Multiple progress bar Widget suitable for the notebook
+    """Multiple progress bar Widget suitable for the notebook
 
     Displays multiple progress bars for a computation, split on computation
     type.
@@ -319,17 +312,15 @@ class MultiProgressWidget(MultiProgressBar):
         interval=0.1,
         func=key_split,
         complete=False,
-        **kwargs
+        **kwargs,
     ):
-        super(MultiProgressWidget, self).__init__(
-            keys, scheduler, func, interval, complete
-        )
+        super().__init__(keys, scheduler, func, interval, complete)
         from ipywidgets import VBox
 
         self.widget = VBox([])
 
     def make_widget(self, all):
-        from ipywidgets import FloatProgress, HBox, VBox, HTML
+        from ipywidgets import HTML, FloatProgress, HBox, VBox
 
         self.elapsed_time = HTML("")
         self.bars = {key: FloatProgress(min=0, max=1, description="") for key in all}
@@ -339,14 +330,14 @@ class MultiProgressWidget(MultiProgressBar):
                 '<div style="padding: 0px 10px 0px 10px;'
                 " text-align:left; word-wrap: "
                 'break-word;">'
-                + html_escape(key.decode() if isinstance(key, bytes) else key)
+                + html.escape(key.decode() if isinstance(key, bytes) else key)
                 + "</div>"
             )
             for key in all
         }
 
         def keyfunc(kv):
-            """ Order keys by most numerous, then by string name """
+            """Order keys by most numerous, then by string name"""
             return kv[::-1]
 
         key_order = [k for k, v in sorted(all.items(), key=keyfunc, reverse=True)]
@@ -371,6 +362,7 @@ class MultiProgressWidget(MultiProgressBar):
                 self.bars[k].bar_style = "danger"
 
         if status == "error":
+            _, exception, _ = clean_exception(exception)
             # self.bars[self.func(key)].bar_style = 'danger'  # TODO
             self.elapsed_time.value = (
                 '<div style="padding: 0px 10px 5px 10px"><b>Exception</b> '
@@ -406,7 +398,7 @@ class MultiProgressWidget(MultiProgressBar):
 
 
 def progress(*futures, notebook=None, multi=True, complete=True, **kwargs):
-    """ Track progress of futures
+    """Track progress of futures
 
     This operates differently in the notebook and the console
 
@@ -415,13 +407,13 @@ def progress(*futures, notebook=None, multi=True, complete=True, **kwargs):
 
     Parameters
     ----------
-    futures: Futures
+    futures : Futures
         A list of futures or keys to track
-    notebook: bool (optional)
+    notebook : bool (optional)
         Running in the notebook or not (defaults to guess)
-    multi: bool (optional)
+    multi : bool (optional)
         Track different functions independently (defaults to True)
-    complete: bool (optional)
+    complete : bool (optional)
         Track all keys (True) or only keys that have not yet run (False)
         (defaults to True)
 

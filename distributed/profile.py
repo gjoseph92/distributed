@@ -24,24 +24,26 @@ We represent this tree as a nested dictionary with the following form:
                    'children': {...}}}
     }
 """
-from __future__ import print_function, division, absolute_import
+from __future__ import annotations
 
 import bisect
-from collections import defaultdict, deque
 import linecache
 import sys
 import threading
+from collections import defaultdict, deque
 from time import sleep
+from typing import Any
 
-import toolz
+import tlz as toolz
+
+from dask.utils import format_time, parse_timedelta
 
 from .metrics import time
-from .utils import format_time, color_of, parse_timedelta
-from .compatibility import get_thread_identity
+from .utils import color_of
 
 
 def identifier(frame):
-    """ A string identifier from a frame
+    """A string identifier from a frame
 
     Strings are cheaper to use as indexes into dicts than tuples or dicts
     """
@@ -58,9 +60,9 @@ def identifier(frame):
 
 
 def repr_frame(frame):
-    """ Render a frame as a line for inclusion into a text traceback """
+    """Render a frame as a line for inclusion into a text traceback"""
     co = frame.f_code
-    text = '  File "%s", line %s, in %s' % (co.co_filename, frame.f_lineno, co.co_name)
+    text = f'  File "{co.co_filename}", line {frame.f_lineno}, in {co.co_name}'
     line = linecache.getline(co.co_filename, frame.f_lineno, frame.f_globals).lstrip()
     return text + "\n\t" + line
 
@@ -77,13 +79,13 @@ def info_frame(frame):
 
 
 def process(frame, child, state, stop=None, omit=None):
-    """ Add counts from a frame stack onto existing state
+    """Add counts from a frame stack onto existing state
 
     This recursively adds counts to the existing state dictionary and creates
     new entries for new functions.
 
-    Example
-    -------
+    Examples
+    --------
     >>> import sys, threading
     >>> ident = threading.get_ident()  # replace with your thread of interest
     >>> frame = sys._current_frames()[ident]
@@ -129,7 +131,7 @@ def process(frame, child, state, stop=None, omit=None):
 
 
 def merge(*args):
-    """ Merge multiple frame states together """
+    """Merge multiple frame states together"""
     if not args:
         return create()
     s = {arg["identifier"] for arg in args}
@@ -140,7 +142,10 @@ def merge(*args):
         for child in arg["children"]:
             children[child].append(arg["children"][child])
 
-    children = {k: merge(*v) for k, v in children.items()}
+    try:
+        children = {k: merge(*v) for k, v in children.items()}
+    except RecursionError:
+        children = {}
     count = sum(arg["count"] for arg in args)
     return {
         "description": args[0]["description"],
@@ -150,7 +155,7 @@ def merge(*args):
     }
 
 
-def create():
+def create() -> dict[str, Any]:
     return {
         "count": 0,
         "children": {},
@@ -160,7 +165,7 @@ def create():
 
 
 def call_stack(frame):
-    """ Create a call text stack from a frame
+    """Create a call text stack from a frame
 
     Returns
     -------
@@ -174,7 +179,7 @@ def call_stack(frame):
 
 
 def plot_data(state, profile_interval=0.010):
-    """ Convert a profile state into data useful by Bokeh
+    """Convert a profile state into data useful by Bokeh
 
     See Also
     --------
@@ -211,8 +216,6 @@ def plot_data(state, profile_interval=0.010):
         line_numbers.append(desc["line_number"])
         names.append(desc["name"])
 
-        ident = state["identifier"]
-
         try:
             fn = desc["filename"]
         except IndexError:
@@ -227,13 +230,13 @@ def plot_data(state, profile_interval=0.010):
 
         x = start
 
-        for name, child in state["children"].items():
+        for _, child in state["children"].items():
             width = child["count"] * delta
             traverse(child, x, x + width, height + 1)
             x += width
 
     traverse(state, 0, 1, 0)
-    percentages = ["{:.2f}%".format(100 * w) for w in widths]
+    percentages = [f"{100 * w:.1f}%" for w in widths]
     return {
         "left": starts,
         "right": stops,
@@ -280,23 +283,23 @@ def watch(
     omit=None,
     stop=lambda: False,
 ):
-    """ Gather profile information on a particular thread
+    """Gather profile information on a particular thread
 
     This starts a new thread to watch a particular thread and returns a deque
     that holds periodic profile information.
 
     Parameters
     ----------
-    thread_id: int
-    interval: str
+    thread_id : int
+    interval : str
         Time per sample
-    cycle: str
+    cycle : str
         Time per refreshing to a new profile state
-    maxlen: int
+    maxlen : int
         Passed onto deque, maximum number of periods
-    omit: str
+    omit : str
         Don't include entries that start with this filename
-    stop: callable
+    stop : callable
         Function to call to see if we should stop
 
     Returns
@@ -304,7 +307,7 @@ def watch(
     deque
     """
     if thread_id is None:
-        thread_id = get_thread_identity()
+        thread_id = threading.get_ident()
 
     log = deque(maxlen=maxlen)
 
@@ -327,18 +330,17 @@ def watch(
 
 
 def get_profile(history, recent=None, start=None, stop=None, key=None):
-    """ Collect profile information from a sequence of profile states
+    """Collect profile information from a sequence of profile states
 
     Parameters
     ----------
-    history: Sequence[Tuple[time, Dict]]
+    history : Sequence[Tuple[time, Dict]]
         A list or deque of profile states
-    recent: dict
+    recent : dict
         The most recent accumulating state
-    start: time
-    stop: time
+    start : time
+    stop : time
     """
-    now = time()
     if start is None:
         istart = 0
     else:
@@ -369,7 +371,7 @@ def get_profile(history, recent=None, start=None, stop=None, key=None):
 
 
 def plot_figure(data, **kwargs):
-    """ Plot profile data using Bokeh
+    """Plot profile data using Bokeh
 
     This takes the output from the function ``plot_data`` and produces a Bokeh
     figure
@@ -378,15 +380,15 @@ def plot_figure(data, **kwargs):
     --------
     plot_data
     """
-    from bokeh.plotting import ColumnDataSource, figure
     from bokeh.models import HoverTool
+    from bokeh.plotting import ColumnDataSource, figure
 
     if "states" in data:
         data = toolz.dissoc(data, "states")
 
     source = ColumnDataSource(data=data)
 
-    fig = figure(tools="tap", **kwargs)
+    fig = figure(tools="tap,box_zoom,xwheel_zoom,reset", **kwargs)
     r = fig.quad(
         "left",
         "right",
@@ -426,7 +428,7 @@ def plot_figure(data, **kwargs):
             </div>
             <div>
                 <span style="font-size: 14px; font-weight: bold;">Percentage:</span>&nbsp;
-                <span style="font-size: 10px; font-family: Monaco, monospace;">@width</span>
+                <span style="font-size: 10px; font-family: Monaco, monospace;">@percentage</span>
             </div>
             """,
     )
@@ -447,7 +449,7 @@ def _remove_py_stack(frames):
 
 
 def llprocess(frames, child, state):
-    """ Add counts from low level profile information onto existing state
+    """Add counts from low level profile information onto existing state
 
     This uses the ``stacktrace`` module to collect low level stack trace
     information and place it onto the given sttate.
@@ -493,7 +495,7 @@ def llprocess(frames, child, state):
 
 
 def ll_get_stack(tid):
-    """ Collect low level stack information from thread id """
+    """Collect low level stack information from thread id"""
     from stacktrace import get_thread_stack
 
     frames = get_thread_stack(tid, show_python=False)

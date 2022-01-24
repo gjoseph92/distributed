@@ -1,27 +1,23 @@
-from __future__ import print_function, division, absolute_import
-
-from collections import defaultdict
+import asyncio
 import logging
 import uuid
+from collections import defaultdict
+from contextlib import suppress
 
-from tornado import gen
-import tornado.locks
+from tlz import merge
 
-try:
-    from cytoolz import merge
-except ImportError:
-    from toolz import merge
+from dask.utils import parse_timedelta, stringify
 
-from .client import Future, _get_global_client, Client
+from .client import Client, Future
 from .metrics import time
-from .utils import tokey, log_errors
-from .worker import get_client
+from .utils import TimeoutError, log_errors
+from .worker import get_client, get_worker
 
 logger = logging.getLogger(__name__)
 
 
-class VariableExtension(object):
-    """ An extension for the scheduler to manage queues
+class VariableExtension:
+    """An extension for the scheduler to manage Variables
 
     This adds the following routes to the scheduler
 
@@ -34,8 +30,8 @@ class VariableExtension(object):
         self.scheduler = scheduler
         self.variables = dict()
         self.waiting = defaultdict(set)
-        self.waiting_conditions = defaultdict(tornado.locks.Condition)
-        self.started = tornado.locks.Condition()
+        self.waiting_conditions = defaultdict(asyncio.Condition)
+        self.started = asyncio.Condition()
 
         self.scheduler.handlers.update(
             {"variable_set": self.set, "variable_get": self.get}
@@ -46,7 +42,7 @@ class VariableExtension(object):
 
         self.scheduler.extensions["variables"] = self
 
-    def set(self, stream=None, name=None, key=None, data=None, client=None):
+    async def set(self, comm=None, name=None, key=None, data=None, client=None):
         if key is not None:
             record = {"type": "Future", "value": key}
             self.scheduler.client_desires_keys(keys=[key], client="variable-%s" % name)
@@ -58,26 +54,27 @@ class VariableExtension(object):
             pass
         else:
             if old["type"] == "Future" and old["value"] != key:
-                self.release(old["value"], name)
+                asyncio.ensure_future(self.release(old["value"], name))
         if name not in self.variables:
-            self.started.notify_all()
+            async with self.started:
+                self.started.notify_all()
         self.variables[name] = record
 
-    @gen.coroutine
-    def release(self, key, name):
+    async def release(self, key, name):
         while self.waiting[key, name]:
-            yield self.waiting_conditions[name].wait()
+            async with self.waiting_conditions[name]:
+                await self.waiting_conditions[name].wait()
 
         self.scheduler.client_releases_keys(keys=[key], client="variable-%s" % name)
         del self.waiting[key, name]
 
-    def future_release(self, name=None, key=None, token=None, client=None):
+    async def future_release(self, name=None, key=None, token=None, client=None):
         self.waiting[key, name].remove(token)
         if not self.waiting[key, name]:
-            self.waiting_conditions[name].notify_all()
+            async with self.waiting_conditions[name]:
+                self.waiting_conditions[name].notify_all()
 
-    @gen.coroutine
-    def get(self, stream=None, name=None, client=None, timeout=None):
+    async def get(self, comm=None, name=None, client=None, timeout=None):
         start = time()
         while name not in self.variables:
             if timeout is not None:
@@ -85,8 +82,17 @@ class VariableExtension(object):
             else:
                 left = None
             if left and left < 0:
-                raise gen.TimeoutError()
-            yield self.started.wait(timeout=left)
+                raise TimeoutError()
+            try:
+
+                async def _():  # Python 3.6 is odd and requires special help here
+                    await self.started.acquire()
+                    await self.started.wait()
+
+                await asyncio.wait_for(_(), timeout=left)
+            finally:
+                self.started.release()
+
         record = self.variables[name]
         if record["type"] == "Future":
             key = record["value"]
@@ -99,10 +105,9 @@ class VariableExtension(object):
                 msg["traceback"] = ts.exception_blame.traceback
             record = merge(record, msg)
             self.waiting[key, name].add(token)
-        raise gen.Return(record)
+        return record
 
-    @gen.coroutine
-    def delete(self, stream=None, name=None, client=None):
+    async def delete(self, comm=None, name=None, client=None):
         with log_errors():
             try:
                 old = self.variables[name]
@@ -110,13 +115,17 @@ class VariableExtension(object):
                 pass
             else:
                 if old["type"] == "Future":
-                    yield self.release(old["value"], name)
-            del self.waiting_conditions[name]
-            del self.variables[name]
+                    await self.release(old["value"], name)
+            with suppress(KeyError):
+                del self.waiting_conditions[name]
+            with suppress(KeyError):
+                del self.variables[name]
+
+            self.scheduler.remove_client("variable-%s" % name)
 
 
-class Variable(object):
-    """ Distributed Global Variable
+class Variable:
+    """Distributed Global Variable
 
     This allows multiple clients to share futures and data between each other
     with a single mutable variable.  All metadata is sequentialized through the
@@ -130,6 +139,15 @@ class Variable(object):
     .. warning::
 
        This object is experimental and has known issues in Python 2
+
+    Parameters
+    ----------
+    name: string (optional)
+        Name used by other clients and the scheduler to identify the variable.
+        If not given, a random name will be generated.
+    client: Client (optional)
+        Client used for communication with the scheduler.
+        If not given, the default global client will be used.
 
     Examples
     --------
@@ -148,31 +166,33 @@ class Variable(object):
     """
 
     def __init__(self, name=None, client=None, maxsize=0):
-        self.client = client or _get_global_client()
+        try:
+            self.client = client or Client.current()
+        except ValueError:
+            # Initialise new client
+            self.client = get_worker().client
         self.name = name or "variable-" + uuid.uuid4().hex
 
-    @gen.coroutine
-    def _set(self, value):
+    async def _set(self, value):
         if isinstance(value, Future):
-            yield self.client.scheduler.variable_set(
-                key=tokey(value.key), name=self.name
+            await self.client.scheduler.variable_set(
+                key=stringify(value.key), name=self.name
             )
         else:
-            yield self.client.scheduler.variable_set(data=value, name=self.name)
+            await self.client.scheduler.variable_set(data=value, name=self.name)
 
     def set(self, value, **kwargs):
-        """ Set the value of this variable
+        """Set the value of this variable
 
         Parameters
         ----------
-        value: Future or object
+        value : Future or object
             Must be either a Future or a msgpack-encodable value
         """
         return self.client.sync(self._set, value, **kwargs)
 
-    @gen.coroutine
-    def _get(self, timeout=None):
-        d = yield self.client.scheduler.variable_get(
+    async def _get(self, timeout=None):
+        d = await self.client.scheduler.variable_get(
             timeout=timeout, name=self.name, client=self.client.id
         )
         if d["type"] == "Future":
@@ -189,14 +209,23 @@ class Variable(object):
             )
         else:
             value = d["value"]
-        raise gen.Return(value)
+        return value
 
     def get(self, timeout=None, **kwargs):
-        """ Get the value of this variable """
+        """Get the value of this variable
+
+        Parameters
+        ----------
+        timeout : number or string or timedelta, optional
+            Time in seconds to wait before timing out.
+            Instead of number of seconds, it is also possible to specify
+            a timedelta in string format, e.g. "200ms".
+        """
+        timeout = parse_timedelta(timeout)
         return self.client.sync(self._get, timeout=timeout, **kwargs)
 
     def delete(self):
-        """ Delete this variable
+        """Delete this variable
 
         Caution, this affects all clients currently pointing to this variable.
         """

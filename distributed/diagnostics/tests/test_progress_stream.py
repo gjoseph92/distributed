@@ -1,17 +1,11 @@
-from __future__ import print_function, division, absolute_import
-
-
 import pytest
 
 pytest.importorskip("bokeh")
 
 from dask import delayed
+
 from distributed.client import wait
-from distributed.diagnostics.progress_stream import (
-    progress_quads,
-    nbytes_bar,
-    progress_stream,
-)
+from distributed.diagnostics.progress_stream import progress_quads, progress_stream
 from distributed.utils_test import div, gen_cluster, inc
 
 
@@ -63,7 +57,7 @@ def test_progress_quads_too_many():
 
 
 @gen_cluster(client=True)
-def test_progress_stream(c, s, a, b):
+async def test_progress_stream(c, s, a, b):
     futures = c.map(div, [1] * 10, range(10))
 
     x = 1
@@ -71,10 +65,10 @@ def test_progress_stream(c, s, a, b):
         x = delayed(inc)(x)
     future = c.compute(x)
 
-    yield wait(futures + [future])
+    await wait(futures + [future])
 
-    comm = yield progress_stream(s.address, interval=0.010)
-    msg = yield comm.read()
+    comm = await progress_stream(s.address, interval=0.010)
+    msg = await comm.read()
     nbytes = msg.pop("nbytes")
     assert msg == {
         "all": {"div": 10, "inc": 5},
@@ -88,25 +82,7 @@ def test_progress_stream(c, s, a, b):
 
     assert progress_quads(msg)
 
-    yield comm.close()
-
-
-def test_nbytes_bar():
-    nbytes = {"inc": 1000, "dec": 3000}
-    expected = {
-        "name": ["dec", "inc"],
-        "left": [0, 0.75],
-        "center": [0.375, 0.875],
-        "right": [0.75, 1.0],
-        "percent": [75, 25],
-        "MB": [0.003, 0.001],
-        "text": ["dec", "inc"],
-    }
-
-    result = nbytes_bar(nbytes)
-    color = result.pop("color")
-    assert len(set(color)) == 2
-    assert result == expected
+    await comm.close()
 
 
 def test_progress_quads_many_functions():

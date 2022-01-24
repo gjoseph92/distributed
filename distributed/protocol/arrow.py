@@ -1,8 +1,6 @@
-from __future__ import print_function, division, absolute_import
-
-from .serialize import dask_serialize, dask_deserialize
-
 import pyarrow
+
+from .serialize import dask_deserialize, dask_serialize
 
 if pyarrow.__version__ < "0.10":
     raise ImportError(

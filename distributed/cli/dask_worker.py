@@ -1,29 +1,30 @@
-from __future__ import print_function, division, absolute_import
-
+import asyncio
 import atexit
-import logging
-import multiprocessing
 import gc
+import logging
 import os
-from sys import exit
+import signal
+import sys
 import warnings
+from contextlib import suppress
 
 import click
+from tlz import valmap
+from tornado.ioloop import IOLoop, TimeoutError
+
 import dask
-from distributed import Nanny, Worker
-from distributed.utils import parse_timedelta
-from distributed.security import Security
+from dask.system import CPU_COUNT
+
+from distributed import Nanny
 from distributed.cli.utils import check_python_3, install_signal_handlers
 from distributed.comm import get_address_host_port
+from distributed.deploy.utils import nprocesses_nthreads
 from distributed.preloading import validate_preload_argv
 from distributed.proctitle import (
     enable_proctitle_on_children,
     enable_proctitle_on_current,
 )
-
-from toolz import valmap
-from tornado.ioloop import IOLoop, TimeoutError
-from tornado import gen
+from distributed.utils import import_term
 
 logger = logging.getLogger("distributed.dask_worker")
 
@@ -53,12 +54,21 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 )
 @click.option(
     "--worker-port",
-    type=int,
-    default=0,
-    help="Serving computation port, defaults to random",
+    default=None,
+    help="Serving computation port, defaults to random. "
+    "When creating multiple workers with --nprocs, a sequential range of "
+    "worker ports may be used by specifying the first and last available "
+    "ports like <first-port>:<last-port>. For example, --worker-port=3000:3026 "
+    "will use ports 3000, 3001, ..., 3025, 3026.",
 )
 @click.option(
-    "--nanny-port", type=int, default=0, help="Serving nanny port, defaults to random"
+    "--nanny-port",
+    default=None,
+    help="Serving nanny port, defaults to random. "
+    "When creating multiple nannies with --nprocs, a sequential range of "
+    "nanny ports may be used by specifying the first and last available "
+    "ports like <first-port>:<last-port>. For example, --nanny-port=3000:3026 "
+    "will use ports 3000, 3001, ..., 3025, 3026.",
 )
 @click.option(
     "--bokeh-port", type=int, default=None, help="Deprecated.  See --dashboard-address"
@@ -73,9 +83,8 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
     "--dashboard/--no-dashboard",
     "dashboard",
     default=True,
-    show_default=True,
     required=False,
-    help="Launch the Dashboard",
+    help="Launch the Dashboard [default: --dashboard]",
 )
 @click.option(
     "--bokeh/--no-bokeh",
@@ -88,7 +97,7 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
     "--listen-address",
     type=str,
     default=None,
-    help="The address to which the worker binds. " "Example: tcp://0.0.0.0:9000",
+    help="The address to which the worker binds. Example: tcp://0.0.0.0:9000 or tcp://:9000 for IPv4+IPv6",
 )
 @click.option(
     "--contact-address",
@@ -117,9 +126,12 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 @click.option("--nthreads", type=int, default=0, help="Number of threads per process.")
 @click.option(
     "--nprocs",
-    type=int,
+    type=str,
     default=1,
-    help="Number of worker processes to launch.  Defaults to one.",
+    show_default=True,
+    help="Number of worker processes to launch. "
+    "If negative, then (CPU_COUNT + 1 + nprocs) is used. "
+    "Set to 'auto' to set nprocs and nthreads dynamically based on CPU_COUNT",
 )
 @click.option(
     "--name",
@@ -132,30 +144,34 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 @click.option(
     "--memory-limit",
     default="auto",
-    help="Bytes of memory per process that the worker can use. "
-    "This can be an integer (bytes), "
-    "float (fraction of total system memory), "
-    "string (like 5GB or 5000M), "
-    "'auto', or zero for no memory management",
+    show_default=True,
+    help="""\b
+    Bytes of memory per process that the worker can use.
+    This can be:
+    - an integer (bytes), note 0 is a special case for no memory management.
+    - a float (fraction of total system memory).
+    - a string (like 5GB or 5000M).
+    - 'auto' for automatically computing the memory limit.
+    """,
 )
 @click.option(
     "--reconnect/--no-reconnect",
     default=True,
-    help="Reconnect to scheduler if disconnected",
+    help="Reconnect to scheduler if disconnected [default: --reconnect]",
 )
 @click.option(
     "--nanny/--no-nanny",
     default=True,
-    help="Start workers in nanny process for management",
+    help="Start workers in nanny process for management [default: --nanny]",
 )
 @click.option("--pid-file", type=str, default="", help="File to write the process PID")
 @click.option(
-    "--local-directory", default="", type=str, help="Directory to place worker files"
+    "--local-directory", default=None, type=str, help="Directory to place worker files"
 )
 @click.option(
     "--resources",
     type=str,
-    default="",
+    default=None,
     help='Resources for task constraints like "GPU=2 MEM=10e9". '
     "Resources are applied separately to each worker process "
     "(only relevant when starting multiple worker processes with '--nprocs').",
@@ -163,7 +179,7 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 @click.option(
     "--scheduler-file",
     type=str,
-    default="",
+    default=None,
     help="Filename to JSON encoded scheduler information. "
     "Use with dask-scheduler --scheduler-file",
 )
@@ -177,6 +193,35 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
     "--dashboard-prefix", type=str, default="", help="Prefix for the dashboard"
 )
 @click.option(
+    "--lifetime",
+    type=str,
+    default=None,
+    help="If provided, shut down the worker after this duration.",
+)
+@click.option(
+    "--lifetime-stagger",
+    type=str,
+    default="0 seconds",
+    show_default=True,
+    help="Random amount by which to stagger lifetime values",
+)
+@click.option(
+    "--worker-class",
+    type=str,
+    default="dask.distributed.Worker",
+    show_default=True,
+    help="Worker class used to instantiate workers from.",
+)
+@click.option(
+    "--lifetime-restart/--no-lifetime-restart",
+    "lifetime_restart",
+    default=False,
+    show_default=True,
+    required=False,
+    help="Whether or not to restart the worker after the lifetime lapses. "
+    "This assumes that you are using the --lifetime and --nanny keywords",
+)
+@click.option(
     "--preload",
     type=str,
     multiple=True,
@@ -186,6 +231,14 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 )
 @click.argument(
     "preload_argv", nargs=-1, type=click.UNPROCESSED, callback=validate_preload_argv
+)
+@click.option(
+    "--preload-nanny",
+    type=str,
+    multiple=True,
+    is_eager=True,
+    help="Module that should be loaded by each nanny "
+    'like "foo.bar" or "/path/to/foo.py"',
 )
 @click.version_option()
 def main(
@@ -199,25 +252,20 @@ def main(
     nprocs,
     nanny,
     name,
-    memory_limit,
     pid_file,
-    reconnect,
     resources,
     dashboard,
     bokeh,
     bokeh_port,
-    local_directory,
     scheduler_file,
-    interface,
-    protocol,
-    death_timeout,
-    preload,
-    preload_argv,
     dashboard_prefix,
     tls_ca_file,
     tls_cert,
     tls_key,
     dashboard_address,
+    worker_class,
+    preload_nanny,
+    **kwargs,
 ):
     g0, g1, g2 = gc.get_threshold()  # https://github.com/dask/distributed/issues/1653
     gc.set_threshold(g0 * 3, g1 * 3, g2 * 3)
@@ -237,46 +285,63 @@ def main(
         )
         dashboard = bokeh
 
-    sec = Security(
-        tls_ca_file=tls_ca_file, tls_worker_cert=tls_cert, tls_worker_key=tls_key
-    )
+    sec = {
+        k: v
+        for k, v in [
+            ("tls_ca_file", tls_ca_file),
+            ("tls_worker_cert", tls_cert),
+            ("tls_worker_key", tls_key),
+        ]
+        if v is not None
+    }
 
-    if nprocs > 1 and worker_port != 0:
+    if nprocs == "auto":
+        nprocs, nthreads = nprocesses_nthreads()
+    else:
+        nprocs = int(nprocs)
+
+    if nprocs < 0:
+        nprocs = CPU_COUNT + 1 + nprocs
+
+    if nprocs <= 0:
         logger.error(
-            "Failed to launch worker.  You cannot use the --port argument when nprocs > 1."
+            "Failed to launch worker. Must specify --nprocs so that there's at least one process."
         )
-        exit(1)
+        sys.exit(1)
 
     if nprocs > 1 and not nanny:
         logger.error(
             "Failed to launch worker.  You cannot use the --no-nanny argument when nprocs > 1."
         )
-        exit(1)
+        sys.exit(1)
 
     if contact_address and not listen_address:
         logger.error(
             "Failed to launch worker. "
             "Must specify --listen-address when --contact-address is given"
         )
-        exit(1)
+        sys.exit(1)
 
     if nprocs > 1 and listen_address:
         logger.error(
             "Failed to launch worker. "
             "You cannot specify --listen-address when nprocs > 1."
         )
-        exit(1)
+        sys.exit(1)
 
     if (worker_port or host) and listen_address:
         logger.error(
             "Failed to launch worker. "
             "You cannot specify --listen-address when --worker-port or --host is given."
         )
-        exit(1)
+        sys.exit(1)
 
     try:
         if listen_address:
             (host, worker_port) = get_address_host_port(listen_address, strict=True)
+            if ":" in host:
+                # IPv6 -- bracket to pass as user args
+                host = f"[{host}]"
 
         if contact_address:
             # we only need this to verify it is getting parsed
@@ -286,7 +351,7 @@ def main(
             contact_address = listen_address
     except ValueError as e:
         logger.error("Failed to launch worker. " + str(e))
-        exit(1)
+        sys.exit(1)
 
     if nanny:
         port = nanny_port
@@ -294,7 +359,7 @@ def main(
         port = worker_port
 
     if not nthreads:
-        nthreads = multiprocessing.cpu_count() // nprocs
+        nthreads = CPU_COUNT // nprocs
 
     if pid_file:
         with open(pid_file, "w") as f:
@@ -306,8 +371,6 @@ def main(
 
         atexit.register(del_pid_file)
 
-    services = {}
-
     if resources:
         resources = resources.replace(",", " ").split()
         resources = dict(pair.split("=") for pair in resources)
@@ -317,14 +380,18 @@ def main(
 
     loop = IOLoop.current()
 
+    worker_class = import_term(worker_class)
     if nanny:
-        kwargs = {"worker_port": worker_port, "listen_address": listen_address}
+        kwargs["worker_class"] = worker_class
+        kwargs["preload_nanny"] = preload_nanny
+
+    if nanny:
+        kwargs.update({"worker_port": worker_port, "listen_address": listen_address})
         t = Nanny
     else:
-        kwargs = {}
         if nanny_port:
             kwargs["service_ports"] = {"nanny": nanny_port}
-        t = Worker
+        t = worker_class
 
     if (
         not scheduler
@@ -336,52 +403,47 @@ def main(
             "dask-worker SCHEDULER_ADDRESS:8786"
         )
 
-    if death_timeout is not None:
-        death_timeout = parse_timedelta(death_timeout, "s")
+    with suppress(TypeError, ValueError):
+        name = int(name)
 
     nannies = [
         t(
             scheduler,
             scheduler_file=scheduler_file,
             nthreads=nthreads,
-            services=services,
             loop=loop,
             resources=resources,
-            memory_limit=memory_limit,
-            reconnect=reconnect,
-            local_dir=local_directory,
-            death_timeout=death_timeout,
-            preload=preload,
-            preload_argv=preload_argv,
             security=sec,
             contact_address=contact_address,
-            interface=interface,
-            protocol=protocol,
             host=host,
             port=port,
-            dashboard_address=dashboard_address if dashboard else None,
-            service_kwargs={"dashboard": {"prefix": dashboard_prefix}},
-            name=name if nprocs == 1 or not name else name + "-" + str(i),
-            **kwargs
+            dashboard=dashboard,
+            dashboard_address=dashboard_address,
+            name=name
+            if nprocs == 1 or name is None or name == ""
+            else str(name) + "-" + str(i),
+            **kwargs,
         )
         for i in range(nprocs)
     ]
 
-    @gen.coroutine
-    def close_all():
+    async def close_all():
         # Unregister all workers from scheduler
         if nanny:
-            yield [n.close(timeout=2) for n in nannies]
+            await asyncio.gather(*(n.close(timeout=2) for n in nannies))
+
+    signal_fired = False
 
     def on_signal(signum):
-        logger.info("Exiting on signal %d", signum)
-        close_all()
+        nonlocal signal_fired
+        signal_fired = True
+        if signum != signal.SIGINT:
+            logger.info("Exiting on signal %d", signum)
+        return asyncio.ensure_future(close_all())
 
-    @gen.coroutine
-    def run():
-        yield nannies
-        while all(n.status != "closed" for n in nannies):
-            yield gen.sleep(0.2)
+    async def run():
+        await asyncio.gather(*nannies)
+        await asyncio.gather(*(n.finished() for n in nannies))
 
     install_signal_handlers(loop, cleanup=on_signal)
 
@@ -389,7 +451,9 @@ def main(
         loop.run_sync(run)
     except TimeoutError:
         # We already log the exception in nanny / worker. Don't do it again.
-        raise TimeoutError("Timed out starting worker.") from None
+        if not signal_fired:
+            logger.info("Timed out starting worker")
+        sys.exit(1)
     except KeyboardInterrupt:
         pass
     finally:

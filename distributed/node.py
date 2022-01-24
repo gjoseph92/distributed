@@ -1,45 +1,21 @@
-from __future__ import print_function, division, absolute_import
-
-import warnings
 import logging
+import warnings
+import weakref
+from contextlib import suppress
 
-from tornado.ioloop import IOLoop
+import tlz
+from tornado.httpserver import HTTPServer
+
 import dask
 
-from .compatibility import unicode, finalize
-from .core import Server, ConnectionPool
+from .comm import get_address_host, get_tcp_server_addresses
+from .core import Server
+from .http.routing import RoutingApplication
+from .utils import DequeHandler, clean_dashboard_address
 from .versions import get_versions
-from .utils import DequeHandler
 
 
-class Node(object):
-    """
-    Base class for nodes in a distributed cluster.
-    """
-
-    def __init__(
-        self,
-        connection_limit=512,
-        deserialize=True,
-        connection_args=None,
-        io_loop=None,
-        serializers=None,
-        deserializers=None,
-        timeout=None,
-    ):
-        self.io_loop = io_loop or IOLoop.current()
-        self.rpc = ConnectionPool(
-            limit=connection_limit,
-            deserialize=deserialize,
-            serializers=serializers,
-            deserializers=deserializers,
-            connection_args=connection_args,
-            timeout=timeout,
-            server=self,
-        )
-
-
-class ServerNode(Node, Server):
+class ServerNode(Server):
     """
     Base class for server nodes in a distributed cluster.
     """
@@ -48,39 +24,6 @@ class ServerNode(Node, Server):
 
     # XXX avoid inheriting from Server? there is some large potential for confusion
     # between base and derived attribute namespaces...
-
-    def __init__(
-        self,
-        handlers=None,
-        blocked_handlers=None,
-        stream_handlers=None,
-        connection_limit=512,
-        deserialize=True,
-        connection_args=None,
-        io_loop=None,
-        serializers=None,
-        deserializers=None,
-        timeout=None,
-    ):
-        Node.__init__(
-            self,
-            deserialize=deserialize,
-            connection_limit=connection_limit,
-            connection_args=connection_args,
-            io_loop=io_loop,
-            serializers=serializers,
-            deserializers=deserializers,
-            timeout=timeout,
-        )
-        Server.__init__(
-            self,
-            handlers=handlers,
-            blocked_handlers=blocked_handlers,
-            stream_handlers=stream_handlers,
-            connection_limit=connection_limit,
-            deserialize=deserialize,
-            io_loop=self.io_loop,
-        )
 
     def versions(self, comm=None, packages=None):
         return get_versions(packages=packages)
@@ -96,7 +39,7 @@ class ServerNode(Node, Server):
             else:
                 port = 0
 
-            if isinstance(port, (str, unicode)):
+            if isinstance(port, str):
                 port = port.split(":")
 
             if isinstance(port, (tuple, list)):
@@ -120,7 +63,7 @@ class ServerNode(Node, Server):
                 self.services[k] = service
             except Exception as e:
                 warnings.warn(
-                    "\nCould not launch service '%s' on port %s. " % (k, port)
+                    f"\nCould not launch service '{k}' on port {port}. "
                     + "Got the following message:\n\n"
                     + str(e),
                     stacklevel=3,
@@ -142,20 +85,101 @@ class ServerNode(Node, Server):
             logging.Formatter(dask.config.get("distributed.admin.log-format"))
         )
         logger.addHandler(self._deque_handler)
-        finalize(self, logger.removeHandler, self._deque_handler)
+        weakref.finalize(self, logger.removeHandler, self._deque_handler)
 
-    def get_logs(self, comm=None, n=None):
+    def get_logs(self, comm=None, start=None, n=None, timestamps=False):
+        """
+        Fetch log entries for this node
+
+        Parameters
+        ----------
+        start : float, optional
+            A time (in seconds) to begin filtering log entries from
+        n : int, optional
+            Maximum number of log entries to return from filtered results
+        timestamps : bool, default False
+            Do we want log entries to include the time they were generated?
+
+        Returns
+        -------
+        List of tuples containing the log level, message, and (optional) timestamp for each filtered entry
+        """
         deque_handler = self._deque_handler
-        if n is None:
-            L = list(deque_handler.deque)
-        else:
-            L = deque_handler.deque
-            L = [L[-i] for i in range(min(n, len(L)))]
-        return [(msg.levelname, deque_handler.format(msg)) for msg in L]
+        if start is None:
+            start = -1
+        L = []
+        for count, msg in enumerate(deque_handler.deque):
+            if n and count >= n or msg.created < start:
+                break
+            if timestamps:
+                L.append((msg.created, msg.levelname, deque_handler.format(msg)))
+            else:
+                L.append((msg.levelname, deque_handler.format(msg)))
+        return L
 
-    async def __aenter__(self):
-        await self
-        return self
+    def start_http_server(
+        self, routes, dashboard_address, default_port=0, ssl_options=None
+    ):
+        """This creates an HTTP Server running on this node"""
 
-    async def __aexit__(self, typ, value, traceback):
-        await self.close()
+        self.http_application = RoutingApplication(routes)
+
+        # TLS configuration
+        tls_key = dask.config.get("distributed.scheduler.dashboard.tls.key")
+        tls_cert = dask.config.get("distributed.scheduler.dashboard.tls.cert")
+        tls_ca_file = dask.config.get("distributed.scheduler.dashboard.tls.ca-file")
+        if tls_cert:
+            import ssl
+
+            ssl_options = ssl.create_default_context(
+                cafile=tls_ca_file, purpose=ssl.Purpose.SERVER_AUTH
+            )
+            ssl_options.load_cert_chain(tls_cert, keyfile=tls_key)
+            # We don't care about auth here, just encryption
+            ssl_options.check_hostname = False
+            ssl_options.verify_mode = ssl.CERT_NONE
+
+        self.http_server = HTTPServer(self.http_application, ssl_options=ssl_options)
+
+        http_addresses = clean_dashboard_address(dashboard_address or default_port)
+
+        for http_address in http_addresses:
+            if http_address["address"] is None:
+                address = self._start_address
+                if isinstance(address, (list, tuple)):
+                    address = address[0]
+                if address:
+                    with suppress(ValueError):
+                        http_address["address"] = get_address_host(address)
+
+            change_port = False
+            retries_left = 3
+            while True:
+                try:
+                    if not change_port:
+                        self.http_server.listen(**http_address)
+                    else:
+                        self.http_server.listen(**tlz.merge(http_address, {"port": 0}))
+                    break
+                except Exception:
+                    change_port = True
+                    retries_left = retries_left - 1
+                    if retries_left < 1:
+                        raise
+
+        bound_addresses = get_tcp_server_addresses(self.http_server)
+
+        # If more than one address is configured we just use the first here
+        self.http_server.port = bound_addresses[0][1]
+        self.services["dashboard"] = self.http_server
+
+        # Warn on port changes
+        for expected, actual in zip(
+            [a["port"] for a in http_addresses], [b[1] for b in bound_addresses]
+        ):
+            if expected != actual and expected > 0:
+                warnings.warn(
+                    f"Port {expected} is already in use.\n"
+                    "Perhaps you already have a cluster running?\n"
+                    f"Hosting the HTTP server on port {actual} instead"
+                )

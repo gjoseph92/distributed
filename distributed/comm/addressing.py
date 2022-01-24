@@ -1,17 +1,14 @@
-from __future__ import print_function, division, absolute_import
+from __future__ import annotations
 
-import six
+import itertools
 
 import dask
 
-from . import registry
 from ..utils import get_ip_interface
+from . import registry
 
 
-DEFAULT_SCHEME = dask.config.get("distributed.comm.default-scheme")
-
-
-def parse_address(addr, strict=False):
+def parse_address(addr: str, strict: bool = False) -> tuple[str, str]:
     """
     Split address into its scheme and scheme-dependent location string.
 
@@ -20,7 +17,7 @@ def parse_address(addr, strict=False):
 
     If strict is set to true the address must have a scheme.
     """
-    if not isinstance(addr, six.string_types):
+    if not isinstance(addr, str):
         raise TypeError("expected str, got %r" % addr.__class__.__name__)
     scheme, sep, loc = addr.rpartition("://")
     if strict and not sep:
@@ -31,21 +28,21 @@ def parse_address(addr, strict=False):
         )
         raise ValueError(msg)
     if not sep:
-        scheme = DEFAULT_SCHEME
+        scheme = dask.config.get("distributed.comm.default-scheme")
     return scheme, loc
 
 
-def unparse_address(scheme, loc):
+def unparse_address(scheme: str, loc: str) -> str:
     """
     Undo parse_address().
 
     >>> unparse_address('tcp', '127.0.0.1')
     'tcp://127.0.0.1'
     """
-    return "%s://%s" % (scheme, loc)
+    return f"{scheme}://{loc}"
 
 
-def normalize_address(addr):
+def normalize_address(addr: str) -> str:
     """
     Canonicalize address, adding a default scheme if necessary.
 
@@ -57,7 +54,9 @@ def normalize_address(addr):
     return unparse_address(*parse_address(addr))
 
 
-def parse_host_port(address, default_port=None):
+def parse_host_port(
+    address: str | tuple[str, int], default_port: str | int | None = None
+) -> tuple[str, int]:
     """
     Parse an endpoint address given in the form "host:port".
     """
@@ -65,11 +64,13 @@ def parse_host_port(address, default_port=None):
         return address
 
     def _fail():
-        raise ValueError("invalid address %r" % (address,))
+        raise ValueError(
+            f"invalid address {address!r}; maybe: ipv6 needs brackets like [::1]"
+        )
 
     def _default():
         if default_port is None:
-            raise ValueError("missing port number in address %r" % (address,))
+            raise ValueError(f"missing port number in address {address!r}")
         return default_port
 
     if "://" in address:
@@ -88,8 +89,9 @@ def parse_host_port(address, default_port=None):
             port = tail[1:]
     else:
         # Generic notation: 'addr:port' or 'addr'.
-        host, sep, port = address.partition(":")
+        host, sep, port = address.rpartition(":")
         if not sep:
+            host = port
             port = _default()
         elif ":" in host:
             _fail()
@@ -97,19 +99,19 @@ def parse_host_port(address, default_port=None):
     return host, int(port)
 
 
-def unparse_host_port(host, port=None):
+def unparse_host_port(host: str, port: int | None = None) -> str:
     """
     Undo parse_host_port().
     """
     if ":" in host and not host.startswith("["):
-        host = "[%s]" % host
+        host = f"[{host}]"
     if port is not None:
-        return "%s:%s" % (host, port)
+        return f"{host}:{port}"
     else:
         return host
 
 
-def get_address_host_port(addr, strict=False):
+def get_address_host_port(addr: str, strict: bool = False) -> tuple[str, int]:
     """
     Get a (host, port) tuple out of the given address.
     For definition of strict check parse_address
@@ -118,6 +120,8 @@ def get_address_host_port(addr, strict=False):
 
     >>> get_address_host_port('tcp://1.2.3.4:80')
     ('1.2.3.4', 80)
+    >>> get_address_host_port('tcp://[::1]:80')
+    ('::1', 80)
     """
     scheme, loc = parse_address(addr, strict=strict)
     backend = registry.get_backend(scheme)
@@ -125,11 +129,11 @@ def get_address_host_port(addr, strict=False):
         return backend.get_address_host_port(loc)
     except NotImplementedError:
         raise ValueError(
-            "don't know how to extract host and port " "for address %r" % (addr,)
+            f"don't know how to extract host and port for address {addr!r}"
         )
 
 
-def get_address_host(addr):
+def get_address_host(addr: str) -> str:
     """
     Return a hostname / IP address identifying the machine this address
     is located on.
@@ -145,7 +149,7 @@ def get_address_host(addr):
     return backend.get_address_host(loc)
 
 
-def get_local_address_for(addr):
+def get_local_address_for(addr: str) -> str:
     """
     Get a local listening address suitable for reaching *addr*.
 
@@ -162,7 +166,7 @@ def get_local_address_for(addr):
     return unparse_address(scheme, backend.get_local_address_for(loc))
 
 
-def resolve_address(addr):
+def resolve_address(addr: str) -> str:
     """
     Apply scheme-specific address resolution to *addr*, replacing
     all symbolic references with concrete location specifiers.
@@ -177,7 +181,9 @@ def resolve_address(addr):
     return unparse_address(scheme, backend.resolve_address(loc))
 
 
-def uri_from_host_port(host_arg, port_arg, default_port):
+def uri_from_host_port(
+    host_arg: str | None, port_arg: str | None, default_port: int
+) -> str:
     """
     Process the *host* and *port* CLI options.
     Return a URI.
@@ -210,10 +216,65 @@ def uri_from_host_port(host_arg, port_arg, default_port):
     return addr
 
 
+def addresses_from_user_args(
+    host=None,
+    port=None,
+    interface=None,
+    protocol=None,
+    peer=None,
+    security=None,
+    default_port=0,
+) -> list:
+    """Get a list of addresses if the inputs are lists
+
+    This is like ``address_from_user_args`` except that it also accepts lists
+    for some of the arguments.  If these arguments are lists then it will map
+    over them accordingly.
+
+    Examples
+    --------
+    >>> addresses_from_user_args(host="127.0.0.1", protocol=["inproc", "tcp"])
+    ["inproc://127.0.0.1:", "tcp://127.0.0.1:"]
+    """
+
+    def listify(obj):
+        if isinstance(obj, (tuple, list)):
+            return obj
+        else:
+            return itertools.repeat(obj)
+
+    if any(isinstance(x, (tuple, list)) for x in (host, port, interface, protocol)):
+        return [
+            address_from_user_args(
+                host=h,
+                port=p,
+                interface=i,
+                protocol=pr,
+                peer=peer,
+                security=security,
+                default_port=default_port,
+            )
+            for h, p, i, pr in zip(*map(listify, (host, port, interface, protocol)))
+        ]
+    else:
+        return [
+            address_from_user_args(
+                host, port, interface, protocol, peer, security, default_port
+            )
+        ]
+
+
 def address_from_user_args(
-    host=None, port=None, interface=None, protocol=None, peer=None, security=None
-):
-    """ Get an address to listen on from common user provided arguments """
+    host=None,
+    port=None,
+    interface=None,
+    protocol=None,
+    peer=None,
+    security=None,
+    default_port=0,
+) -> str:
+    """Get an address to listen on from common user provided arguments"""
+
     if security and security.require_encryption and not protocol:
         protocol = "tls"
 
@@ -235,11 +296,11 @@ def address_from_user_args(
         host = protocol.rstrip("://") + "://" + host
 
     if host or port:
-        addr = uri_from_host_port(host, port, 0)
+        addr = uri_from_host_port(host, port, default_port)
     else:
         addr = ""
 
-    if protocol and "://" not in addr:
-        addr = protocol.rstrip("://") + "://" + addr
+    if protocol:
+        addr = protocol.rstrip("://") + "://" + addr.split("://")[-1]
 
     return addr

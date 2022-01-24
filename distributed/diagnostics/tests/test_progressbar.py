@@ -1,12 +1,8 @@
-from __future__ import print_function, division, absolute_import
-
 from time import sleep
 
-from distributed import Scheduler, Worker
 from distributed.diagnostics.progressbar import TextProgressBar, progress
 from distributed.metrics import time
-from distributed.utils_test import inc, div, gen_cluster, gen_test
-from distributed.utils_test import client, loop, cluster_fixture  # noqa: F401
+from distributed.utils_test import div, gen_cluster, inc
 
 
 def test_text_progressbar(capsys, client):
@@ -25,44 +21,34 @@ def test_text_progressbar(capsys, client):
 
 
 @gen_cluster(client=True)
-def test_TextProgressBar_error(c, s, a, b):
+async def test_TextProgressBar_error(c, s, a, b):
     x = c.submit(div, 1, 0)
 
     progress = TextProgressBar([x.key], scheduler=s.address, start=False, interval=0.01)
-    yield progress.listen()
+    await progress.listen()
 
     assert progress.status == "error"
     assert progress.comm.closed()
 
     progress = TextProgressBar([x.key], scheduler=s.address, start=False, interval=0.01)
-    yield progress.listen()
+    await progress.listen()
     assert progress.status == "error"
     assert progress.comm.closed()
 
 
-def test_TextProgressBar_empty(capsys):
-    @gen_test()
-    def f():
-        s = yield Scheduler(port=0)
-        a, b = yield [Worker(s.address, nthreads=1), Worker(s.address, nthreads=1)]
+@gen_cluster()
+async def test_TextProgressBar_empty(s, a, b, capsys):
+    progress = TextProgressBar([], scheduler=s.address, start=False, interval=0.01)
+    await progress.listen()
 
-        progress = TextProgressBar([], scheduler=s.address, start=False, interval=0.01)
-        yield progress.listen()
-
-        assert progress.status == "finished"
-        check_bar_completed(capsys)
-
-        yield [a.close(), b.close()]
-        s.close()
-        yield s.finished()
-
-    f()
+    assert progress.status == "finished"
+    check_bar_completed(capsys)
 
 
 def check_bar_completed(capsys, width=40):
     out, err = capsys.readouterr()
     # trailing newline so grab next to last line for final state of bar
-    bar, percent, time = [i.strip() for i in out.split("\r")[-2].split("|")]
+    bar, percent, time = (i.strip() for i in out.split("\r")[-2].split("|"))
     assert bar == "[" + "#" * width + "]"
     assert percent == "100% Completed"
 

@@ -1,20 +1,20 @@
-from __future__ import print_function, division, absolute_import
-
+import asyncio
 import logging
 import logging.config
 import os
 import sys
 
-import dask
 import yaml
 
-from .compatibility import logging_names
+import dask
+from dask.utils import import_required
+
+from .compatibility import WINDOWS, logging_names
 
 config = dask.config.config
 
 
 fn = os.path.join(os.path.dirname(__file__), "distributed.yaml")
-dask.config.ensure_file(source=fn)
 
 with open(fn) as f:
     defaults = yaml.safe_load(f)
@@ -50,6 +50,8 @@ aliases = {
     "log-length": "distributed.admin.log-length",
     "log-format": "distributed.admin.log-format",
     "pdb-on-err": "distributed.admin.pdb-on-err",
+    "ucx": "distributed.comm.ucx",
+    "rmm": "distributed.rmm",
 }
 
 dask.config.rename(aliases)
@@ -78,11 +80,12 @@ def _initialize_logging_old_style(config):
     loggers = {  # default values
         "distributed": "info",
         "distributed.client": "warning",
-        "bokeh": "critical",
+        "bokeh": "error",
         "tornado": "critical",
         "tornado.application": "error",
     }
-    loggers.update(config.get("logging", {}))
+    base_config = _find_logging_config(config)
+    loggers.update(base_config.get("logging", {}))
 
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(
@@ -105,7 +108,8 @@ def _initialize_logging_new_style(config):
     Initialize logging using logging's "Configuration dictionary schema".
     (ref.: https://docs.python.org/3/library/logging.config.html#configuration-dictionary-schema)
     """
-    logging.config.dictConfig(config.get("logging"))
+    base_config = _find_logging_config(config)
+    logging.config.dictConfig(base_config.get("logging"))
 
 
 def _initialize_logging_file_config(config):
@@ -113,20 +117,34 @@ def _initialize_logging_file_config(config):
     Initialize logging using logging's "Configuration file format".
     (ref.: https://docs.python.org/3/howto/logging.html#configuring-logging)
     """
+    base_config = _find_logging_config(config)
     logging.config.fileConfig(
-        config.get("logging-file-config"), disable_existing_loggers=False
+        base_config.get("logging-file-config"), disable_existing_loggers=False
     )
 
 
+def _find_logging_config(config):
+    """
+    Look for the dictionary containing logging-specific configurations,
+    starting in the 'distributed' dictionary and then trying the top-level
+    """
+    logging_keys = {"logging-file-config", "logging"}
+    if logging_keys & config.get("distributed", {}).keys():
+        return config["distributed"]
+    else:
+        return config
+
+
 def initialize_logging(config):
-    if "logging-file-config" in config:
-        if "logging" in config:
+    base_config = _find_logging_config(config)
+    if "logging-file-config" in base_config:
+        if "logging" in base_config:
             raise RuntimeError(
                 "Config options 'logging-file-config' and 'logging' are mutually exclusive."
             )
         _initialize_logging_file_config(config)
     else:
-        log_config = config.get("logging", {})
+        log_config = base_config.get("logging", {})
         if "version" in log_config:
             # logging module mandates version to be an int
             log_config["version"] = int(log_config["version"])
@@ -135,4 +153,31 @@ def initialize_logging(config):
             _initialize_logging_old_style(config)
 
 
+def initialize_event_loop(config):
+    event_loop = dask.config.get("distributed.admin.event-loop")
+    if event_loop == "uvloop":
+        uvloop = import_required(
+            "uvloop",
+            "The distributed.admin.event-loop configuration value "
+            "is set to 'uvloop' but the uvloop module is not installed"
+            "\n\n"
+            "Please either change the config value or install one of the following\n"
+            "    conda install uvloop\n"
+            "    pip install uvloop",
+        )
+        uvloop.install()
+    elif event_loop in {"asyncio", "tornado"}:
+        if WINDOWS:
+            # WindowsProactorEventLoopPolicy is not compatible with tornado 6
+            # fallback to the pre-3.8 default of Selector
+            # https://github.com/tornadoweb/tornado/issues/2608
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    else:
+        raise ValueError(
+            "Expected distributed.admin.event-loop to be in ('asyncio', 'tornado', 'uvloop'), got %s"
+            % dask.config.get("distributed.admin.event-loop")
+        )
+
+
 initialize_logging(dask.config.config)
+initialize_event_loop(dask.config.config)
