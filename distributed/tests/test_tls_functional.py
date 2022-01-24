@@ -104,6 +104,12 @@ async def test_nanny(c, s, a, b):
     config={"distributed.worker.memory.rebalance.sender-min": 0.3},
 )
 async def test_rebalance(c, s, *_):
+    def print_memory(msg: str):
+        print(f"*** {msg} ***")
+        for addr, w in s.workers.items():
+            print(addr)
+            print(w.memory)
+
     # We used nannies to have separate processes for each worker
     a, b = s.workers
     assert a.startswith("tls://")
@@ -111,6 +117,7 @@ async def test_rebalance(c, s, *_):
     # Generate 10 buffers worth 512 MiB total on worker a. This sends its memory
     # utilisation slightly above 50% (after counting unmanaged) which is above the
     # distributed.worker.memory.rebalance.sender-min threshold.
+    print_memory("before submit data")
     futures = c.map(lambda _: "x" * (2 ** 29 // 10), range(10), workers=[a])
     await wait(futures)
 
@@ -118,11 +125,16 @@ async def test_rebalance(c, s, *_):
     while s.memory.process < 2 ** 29:
         await asyncio.sleep(0.1)
 
+    print_memory("after heartbeats")
+
     assert await c.run(lambda dask_worker: len(dask_worker.data)) == {a: 10, b: 0}
+    print_memory("after c.run")
 
     await c.rebalance()
+    print_memory("after rebalance")
 
     ndata = await c.run(lambda dask_worker: len(dask_worker.data))
+    print_memory("after second c.run")
     # Allow for some uncertainty as the unmanaged memory is not stable
     assert sum(ndata.values()) == 10
     assert 3 <= ndata[a] <= 7

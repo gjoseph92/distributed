@@ -2676,23 +2676,42 @@ async def assert_ndata(client, by_addr, total=None):
     config={"distributed.worker.memory.rebalance.sender-min": 0.3},
 )
 async def test_rebalance(c, s, *_):
+    def print_memory(msg: str):
+        print(f"*** {msg} ***")
+        for addr, w in s.workers.items():
+            print(addr)
+            print(w.memory)
+
     # We used nannies to have separate processes for each worker
     a, b = s.workers
 
     # Generate 10 buffers worth 512 MiB total on worker a. This sends its memory
     # utilisation slightly above 50% (after counting unmanaged) which is above the
     # distributed.worker.memory.rebalance.sender-min threshold.
+    print_memory("before submit data")
     futures = c.map(lambda _: "x" * (2 ** 29 // 10), range(10), workers=[a])
     await wait(futures)
     # Wait for heartbeats
+
+    await asyncio.sleep(1)
+    print_memory("after heartbeats")
+
     await assert_memory(s, "process", 512, 1024)
     await assert_ndata(c, {a: 10, b: 0})
+
     await s.rebalance()
+
+    await asyncio.sleep(1)
+    print_memory("after rebalance")
+
     # Allow for some uncertainty as the unmanaged memory is not stable
     await assert_ndata(c, {a: (3, 7), b: (3, 7)}, total=10)
+    print_memory("after assert_ndata")
 
     # rebalance() when there is nothing to do
     await s.rebalance()
+    await asyncio.sleep(1)
+    print_memory("after rebalance with nothing to do")
     await assert_ndata(c, {a: (3, 7), b: (3, 7)}, total=10)
 
 
