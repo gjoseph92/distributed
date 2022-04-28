@@ -578,13 +578,14 @@ class RetireWorker(ActiveMemoryManagerPolicy):
     def __init__(self, address: str):
         self.address = address
         self.no_recipients = False
+        self.ignore_ts: set[TaskState] = set()
 
     def __repr__(self) -> str:
         return f"RetireWorker({self.address!r})"
 
     def run(self) -> SuggestionGenerator:
         """"""
-        ws = self.manager.scheduler.workers.get(self.address)
+        ws: WorkerState | None = self.manager.scheduler.workers.get(self.address)
         if ws is None:
             logger.debug("Removing policy %s: Worker no longer in cluster", self)
             self.manager.policies.remove(self)
@@ -657,11 +658,28 @@ class RetireWorker(ActiveMemoryManagerPolicy):
             logger.info(
                 f"Retiring worker {self.address}; no unique keys need to be moved away."
             )
-            self.manager.policies.remove(self)
+            # Any tasks that are currently ready or executing on the worker might
+            # land in memory in the future. We can ignore them when considering `done`.
+            processing = [ts for ts in ws.processing]
+            self.ignore_ts.update(processing)
+            # Also, any dependencies of those tasks that were in flight might arrive
+            # in the future. We can ignore those as well.
+            self.ignore_ts.update(
+                dts
+                for ts in processing
+                for dts in ts.dependencies
+                if ws not in dts.who_has
+            )
+            # We're done, but we leave the policy running. It will be removed at the top of `run`
+            # when the worker is actually removed from the cluster.
 
     def done(self) -> bool:
         """Return True if it is safe to close the worker down; False otherwise"""
+        if self.no_recipients:
+            return True
         ws = self.manager.scheduler.workers.get(self.address)
         if ws is None:
             return True
-        return all(len(ts.who_has) > 1 for ts in ws.has_what)
+        return all(
+            len(ts.who_has) > 1 for ts in ws.has_what if ts not in self.ignore_ts
+        )
