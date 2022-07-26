@@ -30,8 +30,8 @@ jobs:
           - os: macos-latest
             python-version: 3.9
         include:
-          - partition: "ci1"
-            partition-label: "ci1"
+          # - partition: "ci1"
+          #   partition-label: "ci1"
           - partition: "not ci1"
             partition-label: "notci1"
 
