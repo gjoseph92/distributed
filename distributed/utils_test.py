@@ -1350,14 +1350,20 @@ def popen(
         args[0] = os.path.join(
             os.environ.get("DESTDIR", "") + sys.prefix, "bin", args[0]
         )
+
+    logger.info(f"Starting subprocess {args}")
     with subprocess.Popen(args, **kwargs) as proc:
+        logger.info("Subprocess started")
         try:
             yield proc
         finally:
+            logger.info("popen contextmanager exited; terminating process")
             try:
                 _terminate_process(proc, terminate_timeout)
+                logger.info("process terminated successfully")
             finally:
                 out, err = proc.communicate(timeout=kill_timeout)
+                logger.info("process terminated or killed successfully")
                 if out:
                     print(f"------ stdout: returncode {proc.returncode}, {args} ------")
                     print(out.decode() if isinstance(out, bytes) else out)
