@@ -25,15 +25,13 @@ jobs:
         os: [macos-latest]
         python-version: ["3.8", "3.9", "3.10"]
         # Cherry-pick test modules to split the overall runtime roughly in half
-        partition: ["not ci1"]
+        partition: ["ci3"]
         exclude:
           - os: macos-latest
             python-version: 3.9
         include:
-          # - partition: "ci1"
-          #   partition-label: "ci1"
-          - partition: "not ci1"
-            partition-label: "notci1"
+          - partition: "ci3"
+            partition-label: "ci3"
 
         # Uncomment to stress-test the test suite for random failures.
         # Must also change env.TEST_ID below.
