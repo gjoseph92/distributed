@@ -33,6 +33,22 @@ from distributed.utils_test import (
 )
 
 
+def popen_pyspy(args):
+    # HACK https://stackoverflow.com/a/51955499/17100540
+    curtest = os.environ["PYTEST_CURRENT_TEST"].split(" ")[0].replace("/", ".")
+    pyspy_args = [
+        "py-spy",
+        "record",
+        "--idle",
+        "-f",
+        "speedscope",
+        "-o",
+        f"profiles/{curtest}.json",
+        "--",
+    ]
+    return popen(pyspy_args + args)
+
+
 def _get_dashboard_port(client: Client) -> int:
     match = re.search(r":(\d+)\/status", client.dashboard_link)
     assert match
@@ -40,7 +56,7 @@ def _get_dashboard_port(client: Client) -> int:
 
 
 def test_defaults(loop, requires_default_ports):
-    with popen(["dask-scheduler"]):
+    with popen_pyspy(["dask-scheduler"]):
 
         async def f():
             # Default behaviour is to listen on all addresses
@@ -53,7 +69,9 @@ def test_defaults(loop, requires_default_ports):
 
 def test_hostport(loop):
     port = open_port()
-    with popen(["dask-scheduler", "--no-dashboard", "--host", f"127.0.0.1:{port}"]):
+    with popen_pyspy(
+        ["dask-scheduler", "--no-dashboard", "--host", f"127.0.0.1:{port}"]
+    ):
 
         async def f():
             # The scheduler's main port can't be contacted from the outside
@@ -65,7 +83,7 @@ def test_hostport(loop):
 
 
 def test_no_dashboard(loop, requires_default_ports):
-    with popen(["dask-scheduler", "--no-dashboard"]):
+    with popen_pyspy(["dask-scheduler", "--no-dashboard"]):
         with Client(f"127.0.0.1:{Scheduler.default_port}", loop=loop):
             response = requests.get("http://127.0.0.1:8787/status/")
             assert response.status_code == 404
@@ -108,7 +126,7 @@ def test_dashboard_non_standard_ports(loop):
     pytest.importorskip("bokeh")
     port1 = open_port()
     port2 = open_port()
-    with popen(
+    with popen_pyspy(
         [
             "dask-scheduler",
             f"--port={port1}",
@@ -249,7 +267,7 @@ def test_pid_file(loop):
 
 def test_scheduler_port_zero(loop):
     with tmpfile() as fn:
-        with popen(
+        with popen_pyspy(
             ["dask-scheduler", "--no-dashboard", "--scheduler-file", fn, "--port", "0"]
         ):
             with Client(scheduler_file=fn, loop=loop) as c:
@@ -260,7 +278,7 @@ def test_scheduler_port_zero(loop):
 def test_dashboard_port_zero(loop):
     pytest.importorskip("bokeh")
     port = open_port()
-    with popen(
+    with popen_pyspy(
         [
             "dask-scheduler",
             "--host",
@@ -494,7 +512,7 @@ def dask_setup(worker):
     worker.foo = 'setup'
 """
     port = open_port()
-    with popen(
+    with popen_pyspy(
         ["dask-scheduler", "--no-dashboard", "--host", f"127.0.0.1:{port}"]
     ) as s:
         with popen(
