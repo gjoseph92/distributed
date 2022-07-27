@@ -38,7 +38,12 @@ pytestmark = pytest.mark.ci3
 
 def popen_pyspy(args):
     # HACK https://stackoverflow.com/a/51955499/17100540
-    curtest = os.environ["PYTEST_CURRENT_TEST"].split(" ")[0].replace("/", ".")
+    curtest = (
+        os.environ["PYTEST_CURRENT_TEST"]
+        .split(" ")[0]
+        .replace("/", ".")
+        .replace(":", "_")
+    )
     pyspy_args = [
         "py-spy",
         "record",
