@@ -22,18 +22,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [macos-latest]
         python-version: ["3.8", "3.9", "3.10"]
         # Cherry-pick test modules to split the overall runtime roughly in half
-        partition: [ci1, not ci1]
+        partition: ["ci3"]
         exclude:
           - os: macos-latest
             python-version: 3.9
         include:
-          - partition: "ci1"
-            partition-label: "ci1"
-          - partition: "not ci1"
-            partition-label: "notci1"
+          - partition: "ci3"
+            partition-label: "ci3"
 
         # Uncomment to stress-test the test suite for random failures.
         # Must also change env.TEST_ID below.
@@ -122,8 +120,9 @@ jobs:
           source continuous_integration/scripts/set_ulimit.sh
           set -o pipefail
           mkdir reports
+          mkdir profiles
 
-          pytest distributed \
+          sudo pytest distributed \
             -m "not avoid_ci and ${{ matrix.partition }}" --runslow \
             --leaks=fds,processes,threads \
             --junitxml reports/pytest.xml -o junit_suite_name=$TEST_ID \
@@ -167,6 +166,16 @@ jobs:
         with:
           name: ${{ env.TEST_ID }}_cluster_dumps
           path: test_cluster_dump
+          if-no-files-found: ignore
+      - name: Upload py-spy profiles
+        # ensure this runs even if pytest fails
+        if: >
+          always() &&
+          (steps.run_tests.outcome == 'success' || steps.run_tests.outcome == 'failure')
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{ env.TEST_ID }}_profiles
+          path: profiles
           if-no-files-found: ignore
 
   # Publish an artifact for the event; used by publish-test-results.yaml

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import re
 
 import psutil
@@ -15,6 +16,7 @@ import sys
 import tempfile
 from time import sleep
 
+import pytest
 import requests
 from click.testing import CliRunner
 
@@ -32,6 +34,59 @@ from distributed.utils_test import (
     popen,
 )
 
+pytestmark = pytest.mark.ci3
+
+
+def popen_pyspy(args):
+    # HACK https://stackoverflow.com/a/51955499/17100540
+    curtest = (
+        os.environ["PYTEST_CURRENT_TEST"]
+        .split(" ")[0]
+        .replace("/", ".")
+        .replace(":", "_")
+    )
+    pyspy_args = [
+        "py-spy",
+        "record",
+        "--idle",
+        "-f",
+        "speedscope",
+        "-o",
+        f"profiles/{curtest}.json",
+        "--",
+    ]
+    return popen(pyspy_args + args)
+
+
+def pyspy(testfunc):
+    @functools.wraps(testfunc)
+    def inner(*args, **kwargs):
+        # HACK https://stackoverflow.com/a/51955499/17100540
+        curtest = (
+            os.environ["PYTEST_CURRENT_TEST"]
+            .split(" ")[0]
+            .replace("/", ".")
+            .replace(":", "_")
+        )
+        with popen(
+            [
+                "py-spy",
+                "record",
+                "--idle",
+                "--subprocesses",
+                "-f",
+                "speedscope",
+                "-o",
+                f"profiles/{curtest}.json",
+                "--pid",
+                str(os.getpid()),
+            ]
+        ):
+            sleep(0.5)
+            return testfunc(*args, **kwargs)
+
+    return inner
+
 
 def _get_dashboard_port(client: Client) -> int:
     match = re.search(r":(\d+)\/status", client.dashboard_link)
@@ -39,6 +94,7 @@ def _get_dashboard_port(client: Client) -> int:
     return int(match.group(1))
 
 
+@pyspy
 def test_defaults(loop, requires_default_ports):
     with popen(["dask-scheduler"]):
 
@@ -51,6 +107,7 @@ def test_defaults(loop, requires_default_ports):
             assert _get_dashboard_port(c) == 8787
 
 
+@pyspy
 def test_hostport(loop):
     port = open_port()
     with popen(["dask-scheduler", "--no-dashboard", "--host", f"127.0.0.1:{port}"]):
@@ -64,6 +121,7 @@ def test_hostport(loop):
             c.sync(f)
 
 
+@pyspy
 def test_no_dashboard(loop, requires_default_ports):
     with popen(["dask-scheduler", "--no-dashboard"]):
         with Client(f"127.0.0.1:{Scheduler.default_port}", loop=loop):
@@ -104,6 +162,7 @@ def test_dashboard(loop):
         requests.get(f"http://127.0.0.1:{dashboard_port}/status/")
 
 
+@pyspy
 def test_dashboard_non_standard_ports(loop):
     pytest.importorskip("bokeh")
     port1 = open_port()
@@ -247,6 +306,7 @@ def test_pid_file(loop):
                 check_pidfile(worker, w)
 
 
+@pyspy
 def test_scheduler_port_zero(loop):
     with tmpfile() as fn:
         with popen(
@@ -257,6 +317,7 @@ def test_scheduler_port_zero(loop):
                 assert c.scheduler.port != 8786
 
 
+@pyspy
 def test_dashboard_port_zero(loop):
     pytest.importorskip("bokeh")
     port = open_port()
@@ -488,6 +549,7 @@ def test_restores_signal_handler():
         signal.signal(signal.SIGINT, original_handler)
 
 
+@pyspy
 def test_multiple_workers_2(loop):
     text = """
 def dask_setup(worker):

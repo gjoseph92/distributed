@@ -31,6 +31,7 @@ from collections.abc import (
 from contextlib import suppress
 from functools import partial
 from numbers import Number
+from time import sleep
 from typing import Any, ClassVar, Literal, cast
 
 import psutil
@@ -4627,6 +4628,8 @@ class Scheduler(SchedulerState, ServerNode):
             )
             msg.update(version_warning)
             bcomm.send(msg)
+
+            sleep(0.2)  # make it show up in pyspy
 
             try:
                 await self.handle_stream(comm=comm, extra={"client": client})
