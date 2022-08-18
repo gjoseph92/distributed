@@ -31,7 +31,7 @@ def pytest_addoption(parser):
 
 def pytest_collection_modifyitems(config, items):
     # https://pytest.org/latest/example/simple.html#control-skipping-of-tests-according-to-command-line-option
-    if skip_slow := config.getoption("--runslow"):
+    if skip_slow := not config.getoption("--runslow"):
         # --runslow given in cli: do not skip slow tests
         skip_slow_marker = pytest.mark.skip(reason="need --runslow option to run")
 
