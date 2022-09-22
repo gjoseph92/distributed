@@ -1938,9 +1938,13 @@ class SchedulerState:
             # All workers busy? Task gets/stays queued.
             return None
 
-        # Just pick the least busy worker.
-        # NOTE: this will lead to worst-case scheduling with regards to co-assignment.
-        ws = min(self.idle.values(), key=lambda ws: len(ws.processing) / ws.nthreads)
+        # Nonsense metric: pick the *most* busy worker!
+        # The busiest worker is *probably* whichever one we picked last time task.
+        # So if this task and the previous one are neighbors (because we typically are
+        # iterating through root tasks in priority order), then we'll tend to
+        # co-assign up to `ws.nthreads` tasks. This reduces future data transfer
+        # for small groups of sibling tasks.
+        ws = max(self.idle.values(), key=lambda ws: len(ws.processing) / ws.nthreads)
         if self.validate:
             assert not _worker_full(ws, self.WORKER_SATURATION), (
                 ws,
