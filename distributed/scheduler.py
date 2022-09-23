@@ -1927,10 +1927,10 @@ class SchedulerState:
 
         """
         if self.validate:
-            # We don't `assert self.is_rootish(ts)` here, because that check is dependent on
+            # We don't `assert self.should_queue(ts)` here, because that check is dependent on
             # cluster size. It's possible a task looked root-ish when it was queued, but the
             # cluster has since scaled up and it no longer does when coming out of the queue.
-            # If `is_rootish` changes to a static definition, then add that assertion here
+            # If `should_queue` changes to a static definition, then add that assertion here
             # (and actually pass in the task).
             assert not math.isinf(self.WORKER_SATURATION)
 
@@ -1987,7 +1987,7 @@ class SchedulerState:
                 partial(self.worker_objective, ts),
             )
         else:
-            # TODO if `is_rootish` would always return True for tasks without dependencies,
+            # TODO if `should_queue` would always return True for tasks without dependencies,
             # we could remove all this logic. The rootish assignment logic would behave
             # more or less the same as this, maybe without gauranteed round-robin though?
             # This path is only reachable when `ts` doesn't have dependencies, but its
@@ -2032,7 +2032,7 @@ class SchedulerState:
         try:
             ts: TaskState = self.tasks[key]
 
-            if self.is_rootish(ts):
+            if self.should_queue(ts):
                 # NOTE: having two root-ish methods is temporary. When the feature flag is removed,
                 # there should only be one, which combines co-assignment and queuing.
                 # Eventually, special-casing root tasks might be removed entirely, with better heuristics.
@@ -2812,19 +2812,20 @@ class SchedulerState:
     # Assigning Tasks to Workers #
     ##############################
 
-    def is_rootish(self, ts: TaskState) -> bool:
+    def should_queue(self, ts: TaskState) -> bool:
         """
-        Whether ``ts`` is a root or root-like task.
+        Whether ``ts`` should be queued (it's a root or root-like task).
 
-        Root-ish tasks are part of a group that's much larger than the cluster,
-        and have few or no dependencies.
+        Good tasks to queue are part of a group that's much larger than the cluster,
+        have few or no dependencies, and aren't widely-shared.
         """
         if ts.resource_restrictions or ts.worker_restrictions or ts.host_restrictions:
             return False
         tg = ts.group
         # TODO short-circuit to True if `not ts.dependencies`?
         return (
-            len(tg) > self.total_nthreads * 2
+            len(ts.dependents) < self.total_nthreads
+            and len(tg) > self.total_nthreads * 2
             and len(tg.dependencies) < 5
             and sum(map(len, tg.dependencies)) < 5
         )
