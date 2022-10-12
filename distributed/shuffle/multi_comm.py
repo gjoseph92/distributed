@@ -53,7 +53,7 @@ class MultiComm:
     """
 
     max_message_size = parse_bytes("2 MiB")
-    memory_limit = parse_bytes("100 MiB")
+    memory_limit = 0
     max_connections = 10
     _queues: weakref.WeakKeyDictionary[
         asyncio.AbstractEventLoop, asyncio.Queue
