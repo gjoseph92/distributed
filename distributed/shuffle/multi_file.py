@@ -12,7 +12,6 @@ from collections import defaultdict
 from collections.abc import Iterator
 
 from dask.sizeof import sizeof
-from dask.utils import parse_bytes
 
 from distributed.utils import log_errors
 
@@ -51,9 +50,9 @@ class MultiFile:
         Measures the size of an object in memory
     """
 
-    memory_limit = parse_bytes("1 GiB")
+    memory_limit = 0
     _queues: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-    concurrent_files = 2
+    concurrent_files = 1
     total_size = 0
 
     def __init__(
