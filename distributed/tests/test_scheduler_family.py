@@ -296,3 +296,65 @@ async def test_family_non_commutative(c, s):
     sibs, downstream = fam
     assert sibs == {rts[0], rts[2], rts[3]}
     assert downstream == {ats[0]}
+
+
+@gen_cluster(nthreads=[], client=True)
+async def test_reuse(c, s):
+    r"""
+    a + (a + 1).mean()
+    """
+    roots = [dask.delayed(i, name=f"r-{i}") for i in range(6)]
+    incs = [inc(r, name=f"i-{i}") for i, r in enumerate(roots)]
+    mean = dsum([dsum(incs[:3]), dsum(incs[3:])])
+    deltas = [add(r, mean, dask_key_name=f"d-{i}") for i, r in enumerate(roots)]
+
+    _ = await submit_delayed(c, s, deltas)
+
+
+@gen_cluster(nthreads=[], client=True)
+async def test_common_with_trees(c, s):
+    r"""
+     x       x        x      x
+     /|\    /|\      /|\    /|\
+    a | b  c | d    e | f  g | h
+      |      |        |      |
+       ---------- c ----------
+    """
+    pass
+
+
+@gen_cluster(nthreads=[], client=True)
+async def test_zigzag(c, s):
+    r"""
+    x  x  x  x
+    | /| /| /|
+    r  r  r  r
+    """
+    roots = [dask.delayed(i, name=f"r-{i}") for i in range(4)]
+    others = [
+        inc(roots[0]),
+        add(roots[0], roots[1]),
+        add(roots[1], roots[2]),
+        add(roots[2], roots[3]),
+    ]
+
+    _ = await submit_delayed(c, s, others)
+
+
+@gen_cluster(nthreads=[], client=True)
+async def test_overlap(c, s):
+    r"""
+    x  x  x  x
+    |\/|\/|\/|
+    |/\|/\|/\|
+    r  r  r  r
+    """
+    roots = [dask.delayed(i, name=f"r-{i}") for i in range(4)]
+    others = [
+        add(roots[0], roots[1]),
+        dsum(roots[0], roots[1], roots[2]),
+        dsum(roots[1], roots[2], roots[3]),
+        add(roots[2], roots[3]),
+    ]
+
+    _ = await submit_delayed(c, s, others)
