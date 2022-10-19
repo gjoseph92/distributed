@@ -79,6 +79,7 @@ from distributed.core import Status, clean_exception, rpc, send_recv
 from distributed.diagnostics.memory_sampler import MemorySamplerExtension
 from distributed.diagnostics.plugin import SchedulerPlugin, _get_plugin_name
 from distributed.event import EventExtension
+from distributed.families import group_by_family
 from distributed.http import get_handlers
 from distributed.lock import LockExtension
 from distributed.metrics import monotonic, time
@@ -1113,6 +1114,8 @@ class TaskState:
     #: The group of tasks to which this one belongs
     group: TaskGroup
 
+    family: list[TaskState] | None
+
     #: Same as of group.name
     group_key: str
 
@@ -1163,6 +1166,7 @@ class TaskState:
         self.type = None  # type: ignore
         self.group_key = key_split_group(key)
         self.group = None  # type: ignore
+        self.family = None
         self.metadata = {}
         self.annotations = {}
         self.erred_on = set()
@@ -4370,7 +4374,14 @@ class Scheduler(SchedulerState, ServerNode):
         # Compute recommendations
         recommendations: dict = {}
 
-        for ts in sorted(runnables, key=operator.attrgetter("priority"), reverse=True):
+        # Calculate families
+        sorted_runnables = sorted(runnables, key=operator.attrgetter("priority"))
+        for fam, proper in group_by_family(sorted_runnables):
+            if proper:
+                for ts in fam:
+                    ts.family = fam
+
+        for ts in sorted_runnables[::-1]:
             if ts.state == "released" and ts.run_spec:
                 recommendations[ts.key] = "waiting"
 
