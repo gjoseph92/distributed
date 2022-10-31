@@ -1485,7 +1485,6 @@ class SchedulerState:
     #######################
 
     #: Workers currently connected to the scheduler
-    #: (actually a SortedDict, but the sortedcontainers package isn't annotated)
     workers: dict[str, WorkerState]
     #: Worker {name: address}
     aliases: dict[Hashable, str]
@@ -1575,7 +1574,7 @@ class SchedulerState:
         self,
         aliases: dict[Hashable, str],
         clients: dict[str, ClientState],
-        workers: SortedDict[str, WorkerState],
+        workers: dict[str, WorkerState],
         host_info: dict[str, dict[str, Any]],
         resources: dict[str, dict[str, float]],
         tasks: dict[str, TaskState],
@@ -4147,7 +4146,7 @@ class Scheduler(SchedulerState, ServerNode):
 
         version_warning = version_module.error_message(
             version_module.get_versions(),
-            {w: ws.versions for w, ws in self.workers.items()},
+            {w: ws.versions for w, ws in sorted(self.workers.items())},
             versions,
             source_name=str(ws.server_id),
         )
@@ -5092,7 +5091,7 @@ class Scheduler(SchedulerState, ServerNode):
             msg = {"op": "stream-start"}
             version_warning = version_module.error_message(
                 version_module.get_versions(),
-                {w: ws.versions for w, ws in self.workers.items()},
+                {w: ws.versions for w, ws in sorted(self.workers.items())},
                 versions,
             )
             msg.update(version_warning)
@@ -6434,7 +6433,7 @@ class Scheduler(SchedulerState, ServerNode):
             memory_ratio = 2
 
         with log_errors():
-            if not n and all([ws.processing for ws in self.workers.values()]):
+            if not n and all(ws.processing for ws in self.workers.values()):
                 return []
 
             if key is None:
@@ -6455,7 +6454,7 @@ class Scheduler(SchedulerState, ServerNode):
             total = sum(group_bytes.values())
 
             def _key(group):
-                is_idle = not any([wws.processing for wws in groups[group]])
+                is_idle = not any(wws.processing for wws in groups[group])
                 bytes = -group_bytes[group]
                 return is_idle, bytes
 
@@ -6466,7 +6465,7 @@ class Scheduler(SchedulerState, ServerNode):
 
             while idle:
                 group = idle.pop()
-                if n is None and any([ws.processing for ws in groups[group]]):
+                if n is None and any(ws.processing for ws in groups[group]):
                     break
 
                 if minimum and n_remain - len(groups[group]) < minimum:
