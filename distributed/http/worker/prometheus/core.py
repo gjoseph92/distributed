@@ -46,6 +46,7 @@ class WorkerMetricCollector(PrometheusCollector):
                 tasks.add_metric(["disk"], n_spilled)
             else:
                 tasks.add_metric([k], n)
+        tasks.add_metric("releasable", len(ws.releasable))
         yield tasks
 
         yield GaugeMetricFamily(

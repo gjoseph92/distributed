@@ -1220,6 +1220,9 @@ class WorkerState:
     #: :attr:`~TaskState.previous` == 'long-running`.
     long_running: set[TaskState]
 
+    # TODO don't need the set, just used for metrics
+    releasable: set[TaskState]
+
     #: A number of tasks that this worker has run in its lifetime; this includes failed
     #: and cancelled tasks. See also :meth:`executing_count`.
     executed_count: int
@@ -1316,6 +1319,7 @@ class WorkerState:
         self.nbytes = 0
         self.executed_count = 0
         self.long_running = set()
+        self.releasable = set()
         self.transfer_message_bytes_limit = transfer_message_bytes_limit
         self.log = deque(maxlen=100_000)
         self.stimulus_log = deque(maxlen=10_000)
@@ -1501,6 +1505,7 @@ class WorkerState:
         self.long_running.discard(ts)
         self.in_flight_tasks.discard(ts)
         self.waiting.discard(ts)
+        self.releasable.discard(ts)
 
     def _should_throttle_incoming_transfers(self) -> bool:
         """Decides whether the WorkerState should throttle data transfers from other workers.
@@ -2969,6 +2974,7 @@ class WorkerState:
                     assert not dts.releasable, (dts, ev)
 
             dts.releasable = releasable
+            self.releasable.add(dts)
 
         return recommendations, instructions
 
