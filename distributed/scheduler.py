@@ -4541,11 +4541,27 @@ class Scheduler(SchedulerState, ServerNode):
 
         # TODO: balance workers
 
-    def decide_rootish_tasks(self, ws: WorkerState) -> Iterator[TaskState]:
+    def decide_queued_tasks(self, ws: WorkerState) -> Iterator[TaskState]:
+        """Pick the next queued tasks to run on a worker with open threads.
+
+        Attempts to maintain co-assignment, by picking tasks that come immediately after
+        (in priority order) what the worker is currently working on.
+
+        When the worker is not processing anything, we jump partway into the queue
+        (according to which number worker this is, out of all workers) and start from
+        there. At the beginning of a graph, this "divvies up" the queue, so each worker
+        will generally be responsible for as long of a contiguous stretch of the queue
+        as possible, enabling future co-assignment.
+
+        Note: `self.queued` must not be mutated while iterating over this generator!
+        """
         slots = _task_slots_available(ws, self.WORKER_SATURATION)
         assert slots > 0, (slots, ws)
 
         if not ws.processing:
+            # Divvy the queue up evenly among the workers. Start each worker at points
+            # far apart from each other. That way, when a worker completes task, the
+            # next task in priority order hasn't already been scheduled.
             ws_idx: int
             ws_idx = self.workers.index(ws.address)  # type: ignore
             # TODO assumes all workers have the same number of threads
@@ -4557,19 +4573,25 @@ class Scheduler(SchedulerState, ServerNode):
                 # TODO should we always select from the back of the queue when there are
                 # more workers than needed? Will this lead to uneven task selection?
                 q_idx = len(self.queued) - n
-
-            # print(f"Not processing - {ws_idx=} {q_idx=} {len(self.queued)=}")
         else:
+            # Pick the queued task that comes after whatever the worker's currently doing
             min_processing = min(ws.processing, key=operator.attrgetter("priority"))
+            # Also, check the oldest thing in memory. If it's older than any processing
+            # task, there's a chance our initial divvying dropped us in the middle of a
+            # group of siblings: for example, two inputs to a tree reduce. If the old
+            # task can't be used yet, because its dependent needs some queued task to
+            # also run, prioritize getting the old task out of memory first.
             oldest_mem = next(iter(ws.has_what))
-            if oldest_mem.priority < min_processing.priority:
-                q_idx: int = self.queued.bisect_left(oldest_mem)  # type: ignore
-            else:
-                q_idx: int = self.queued.bisect_left(min_processing)  # type: ignore
-            n = slots  # TODO
-
-            # ws_idx = self.workers.index(ws.address)  # type: ignore
-            # print(f"Processing - {ws_idx=} {q_idx=} {len(self.queued)=}")
+            # TODO this heuristic will be thrown off by `open_zarr` and stuff. Maybe
+            # check for only 1 dependent? Or all siblings queued (how to do cheaply)?
+            # TODO we probably need `q_idx - 1` for this (nearest exit may be behind you)
+            target_ts = (
+                oldest_mem
+                if oldest_mem.priority < min_processing.priority
+                else min_processing
+            )
+            q_idx: int = self.queued.bisect_left(target_ts)  # type: ignore
+            n = slots
 
         qts: TaskState
         for qts in self.queued.islice(q_idx, q_idx + n):  # type: ignore
@@ -4603,7 +4625,7 @@ class Scheduler(SchedulerState, ServerNode):
         submittable = [
             (qts.key, ws)
             for ws in self.idle_task_count
-            for qts in self.decide_rootish_tasks(ws)
+            for qts in self.decide_queued_tasks(ws)
         ]
 
         for key, ws in submittable:
