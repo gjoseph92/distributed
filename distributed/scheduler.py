@@ -4558,40 +4558,43 @@ class Scheduler(SchedulerState, ServerNode):
         slots = _task_slots_available(ws, self.WORKER_SATURATION)
         assert slots > 0, (slots, ws)
 
-        if not ws.processing:
-            # Divvy the queue up evenly among the workers. Start each worker at points
-            # far apart from each other. That way, when a worker completes task, the
-            # next task in priority order hasn't already been scheduled.
-            ws_idx: int
-            ws_idx = self.workers.index(ws.address)  # type: ignore
-            # TODO assumes all workers have the same number of threads
-            tasks_per_worker = math.ceil(len(self.queued) / len(self.workers))
-            q_idx = ws_idx * tasks_per_worker
-            n = min(slots, tasks_per_worker)
+        # if not ws.processing:
+        #     # Divvy the queue up evenly among the workers. Start each worker at points
+        #     # far apart from each other. That way, when a worker completes task, the
+        #     # next task in priority order hasn't already been scheduled.
+        #     ws_idx: int
+        #     ws_idx = self.workers.index(ws.address)  # type: ignore
+        #     # TODO assumes all workers have the same number of threads
+        #     tasks_per_worker = math.ceil(len(self.queued) / len(self.workers))
+        #     q_idx = ws_idx * tasks_per_worker
+        #     n = min(slots, tasks_per_worker)
 
-            if q_idx >= len(self.queued):
-                # TODO should we always select from the back of the queue when there are
-                # more workers than needed? Will this lead to uneven task selection?
-                q_idx = len(self.queued) - n
-        else:
-            # Pick the queued task that comes after whatever the worker's currently doing
-            min_processing = min(ws.processing, key=operator.attrgetter("priority"))
-            # Also, check the oldest thing in memory. If it's older than any processing
-            # task, there's a chance our initial divvying dropped us in the middle of a
-            # group of siblings: for example, two inputs to a tree reduce. If the old
-            # task can't be used yet, because its dependent needs some queued task to
-            # also run, prioritize getting the old task out of memory first.
-            oldest_mem = next(iter(ws.has_what))
-            # TODO this heuristic will be thrown off by `open_zarr` and stuff. Maybe
-            # check for only 1 dependent? Or all siblings queued (how to do cheaply)?
-            # TODO we probably need `q_idx - 1` for this (nearest exit may be behind you)
-            target_ts = (
-                oldest_mem
-                if oldest_mem.priority < min_processing.priority
-                else min_processing
-            )
-            q_idx: int = self.queued.bisect_left(target_ts)  # type: ignore
-            n = slots
+        #     if q_idx >= len(self.queued):
+        #         # TODO should we always select from the back of the queue when there are
+        #         # more workers than needed? Will this lead to uneven task selection?
+        #         q_idx = len(self.queued) - n
+        # else:
+        #     # Pick the queued task that comes after whatever the worker's currently doing
+        #     min_processing = min(ws.processing, key=operator.attrgetter("priority"))
+        #     # Also, check the oldest thing in memory. If it's older than any processing
+        #     # task, there's a chance our initial divvying dropped us in the middle of a
+        #     # group of siblings: for example, two inputs to a tree reduce. If the old
+        #     # task can't be used yet, because its dependent needs some queued task to
+        #     # also run, prioritize getting the old task out of memory first.
+        #     oldest_mem = next(iter(ws.has_what))
+        #     # TODO this heuristic will be thrown off by `open_zarr` and stuff. Maybe
+        #     # check for only 1 dependent? Or all siblings queued (how to do cheaply)?
+        #     # TODO we probably need `q_idx - 1` for this (nearest exit may be behind you)
+        #     target_ts = (
+        #         oldest_mem
+        #         if oldest_mem.priority < min_processing.priority
+        #         else min_processing
+        #     )
+        #     q_idx: int = self.queued.bisect_left(target_ts)  # type: ignore
+        #     n = slots
+
+        q_idx = 0
+        n = 4
 
         qts: TaskState
         for qts in self.queued.islice(q_idx, q_idx + n):  # type: ignore
