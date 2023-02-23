@@ -1094,6 +1094,15 @@ class TaskGroup:
         """
         return recursive_to_dict(self, exclude=exclude, members=True)
 
+    @property
+    def rootish(self) -> bool:
+        return (
+            len(self.dependencies) < 5
+            and (ndeps := sum(map(len, self.dependencies))) < 5
+            # Fan-out
+            and (len(self) / ndeps > 2 if ndeps else True)
+        )
+
 
 class TaskState:
     """A simple object holding information about a task.
@@ -3344,7 +3353,10 @@ class Scheduler(SchedulerState, ServerNode):
         self.generation = 0
         self._last_client = None
         self._last_time = 0
-        queued: HeapSet[TaskState] = HeapSet(key=operator.attrgetter("priority"))
+        queued: HeapSet[TaskState] = HeapSet(
+            # Force root-ish tasks to the back, regardless of priority. (False < True)
+            key=lambda ts: (ts.group.rootish, ts.priority)
+        )
 
         self.datasets = {}
 
