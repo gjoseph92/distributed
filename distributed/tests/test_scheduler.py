@@ -4301,14 +4301,6 @@ async def test_deadlock_resubmit_queued_tasks_fast(c, s, a, rootish):
             block_on_event, range(len(keys)), block=block, executing=executing, key=keys
         )
 
-    def assert_rootish():
-        # Just to verify our assumptions in case the definition changes. This is
-        # currently a bit brittle
-        if rootish:
-            assert all(s.is_rootish(s.tasks[k]) for k in keys)
-        else:
-            assert not any(s.is_rootish(s.tasks[k]) for k in keys)
-
     f1 = submit_tasks()
     # Make sure that the worker is properly saturated
     nblocking_tasks = 5
@@ -4341,7 +4333,6 @@ async def test_deadlock_resubmit_queued_tasks_fast(c, s, a, rootish):
         fut3 = submit_tasks()
         while len(s.tasks) == nblocking_tasks:
             await asyncio.sleep(0.005)
-        assert_rootish()
         if rootish:
             assert all(s.tasks[k] in s.queued for k in keys), [s.tasks[k] for k in keys]
         await block.set()

@@ -2009,12 +2009,6 @@ class SchedulerState:
 
         if not ideal_ws or ideal_ws in self.idle_task_count:
             # No worker at all valid for the task, or ideal worker also idle.
-            if not ideal_ws:
-                print(f"No worker for {ts}")
-            elif not all(dts in ideal_ws.has_what for dts in ts.dependencies):
-                print(
-                    f"xfer {ts} - {len(ts.dependencies)}, ideal, {[dts.who_has for dts in ts.dependencies]}"
-                )
             return ideal_ws
 
         # The best worker is busy. What's the best idle worker? Is it good enough?
@@ -2034,12 +2028,6 @@ class SchedulerState:
         if best_idle_ws and self.worker_good_enough(ts, best_idle_ws, ideal_ws):
             if self.validate:
                 assert best_idle_ws in self.idle_task_count, best_idle_ws
-
-            if not all(dts in best_idle_ws.has_what for dts in ts.dependencies):
-                print(
-                    f"xfer {ts} - {len(ts.dependencies)}, idle, {[dts.who_has for dts in ts.dependencies]}"
-                )
-
             return best_idle_ws
 
         # Since this task is top priority, it should be scheduled immediately, even when
@@ -2047,12 +2035,6 @@ class SchedulerState:
         # slightly longer, but run on the right worker, than to run slightly sooner but
         # transfer unnecessary data, or to remain on the queue and be passed by
         # lower-priority tasks.
-
-        if not all(dts in ideal_ws.has_what for dts in ts.dependencies):
-            print(
-                f"xfer {ts} - {len(ts.dependencies)}, ideal after all, {[dts.who_has for dts in ts.dependencies]}"
-            )
-
         return ideal_ws
 
     def worker_good_enough(
@@ -2082,35 +2064,20 @@ class SchedulerState:
         nbytes_xfer_ideal, *_ = self.worker_objective(ts, ideal_ws)
         nbytes_xfer_other, *_ = self.worker_objective(ts, other_ws)
 
-        if nbytes_xfer_ideal:
-            print(
-                f"{ts} {len(ts.dependencies)} {nbytes_xfer_ideal=} {ideal_ws} {len(self.running)}"
-            )
-
         # If the ideal worker would have no data transfer, only pick `other` if it
         # would open opportunities for future parallelism.
         if nbytes_xfer_ideal == 0:
             if self.validate:
                 assert nbytes_xfer_other > 0, (ts, ideal_ws, other_ws)
 
-            r = all(
+            return all(
                 dts in other_ws.has_what or self.replication_ratio(dts) < 1
                 for dts in ts.dependencies
             )
-            if r:
-                print(
-                    f"{ts} - {other_ws} good enough vs {ideal_ws} - all deps under-replicated - {len(ts.dependencies)=}"
-                )
-            return r
 
         # Both would involve transfer. Pick `other` if the amortized transfer cost
         # isn't much worse.
-        r = nbytes_xfer_other / nbytes_xfer_ideal < 1.5
-        if r:
-            print(
-                f"{ts} - {other_ws} good enough vs {ideal_ws} - {nbytes_xfer_other=}, {nbytes_xfer_ideal=}, {len(ts.dependencies)=}"
-            )
-        return r
+        return nbytes_xfer_other / nbytes_xfer_ideal < 1.5
 
     def transition_waiting_memory(
         self,
