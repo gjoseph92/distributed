@@ -2039,7 +2039,7 @@ class SchedulerState:
         # - run it on `best_available` if it's good enough?
         # - leave it on the queue?
 
-        return None
+        return ideal_ws
 
     def worker_good_enough(
         self, ts: TaskState, other_ws: WorkerState, ideal_ws: WorkerState
@@ -2057,30 +2057,14 @@ class SchedulerState:
             # Since `other` has a task slot open, it's clearly better if comms are equal
             return True
 
-        # NOTE: occupancy is a measure of how long it'll take a worker to complete all
-        # its tasks, which is not necessarily how long a new task would have to wait
-        # until it starts. If `len(processing) < nthreads`, occupancy can be > 0, but
-        # the task wouldn't have to wait at all.
-        # FIXME this is an unfair comparison when `ideal` is full but `other` isn't.
-        # This leads to unnecessary transfers.
-        # We just can't use occupancy here, it's so wrong.
-        ideal_start_time = ideal_comm_cost + (
-            0
-            if len(ideal_ws.processing) < ideal_ws.nthreads
-            else ideal_ws.occupancy / ideal_ws.nthreads
-        )
-        other_start_time = other_comm_cost + (
-            0
-            if len(other_ws.processing) < other_ws.nthreads
-            else other_ws.occupancy / other_ws.nthreads
-        )
-
-        if ideal_start_time >= other_start_time:
-            return True
-
-        speedup = ideal_start_time - other_start_time
-        r = speedup > self.get_task_duration(ts) * 2
-        return r
+        # Occupancy is profoundly inaccurate.
+        # Just use it for an order-of-magnitude comparison.
+        cmp = other_ws.occupancy + other_comm_cost < ideal_ws.occupancy * 100
+        if cmp:
+            print(
+                f"{other_ws.occupancy + other_comm_cost = }, {ideal_ws.occupancy * 100 = }"
+            )
+        return cmp
 
     def transition_waiting_memory(
         self,
