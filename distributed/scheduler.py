@@ -2866,7 +2866,7 @@ class SchedulerState:
         #    consistency with `decide_worker`
         score = (
             nbytes_xfer,
-            len(ws.processing) - len(ws.long_running) / ws.nthreads,
+            (len(ws.processing) - len(ws.long_running)) / ws.nthreads,
             ws.nbytes,
         )
         if ts.actor:
