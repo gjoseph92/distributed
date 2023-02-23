@@ -3288,10 +3288,6 @@ class TaskProgress(DashboardComponent):
                     <span style="font-size: 10px; font-family: Monaco, monospace;">@queued</span>
                 </div>
                 <div>
-                    <span style="font-size: 14px; font-weight: bold;">No-worker:</span>&nbsp;
-                    <span style="font-size: 10px; font-family: Monaco, monospace;">@no_worker</span>
-                </div>
-                <div>
                     <span style="font-size: 14px; font-weight: bold;">Processing:</span>&nbsp;
                     <span style="font-size: 10px; font-family: Monaco, monospace;">@processing</span>
                 </div>
@@ -3317,7 +3313,6 @@ class TaskProgress(DashboardComponent):
             "processing": {},
             "waiting": {},
             "queued": {},
-            "no_worker": {},
         }
 
         for tp in self.scheduler.task_prefixes.values():
@@ -3329,7 +3324,6 @@ class TaskProgress(DashboardComponent):
                 state["processing"][tp.name] = active_states["processing"]
                 state["waiting"][tp.name] = active_states["waiting"]
                 state["queued"][tp.name] = active_states["queued"]
-                state["no_worker"][tp.name] = active_states["no-worker"]
 
         state["all"] = {k: sum(v[k] for v in state.values()) for k in state["memory"]}
 
@@ -3349,7 +3343,6 @@ class TaskProgress(DashboardComponent):
                 "released",
                 "waiting",
                 "queued",
-                "no_worker",
             ]
         }
         totals["processing"] = totals["all"] - sum(
@@ -3362,7 +3355,6 @@ class TaskProgress(DashboardComponent):
             "queued: %(queued)s, "
             "processing: %(processing)s, "
             "in-memory: %(memory)s, "
-            "no-worker: %(no_worker)s, "
             "erred: %(erred)s" % totals
         )
 

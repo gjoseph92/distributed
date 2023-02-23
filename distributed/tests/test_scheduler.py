@@ -145,6 +145,7 @@ async def test_decide_worker_with_restrictions(client, s, a, b, c):
     assert x.key in a.data or x.key in b.data
 
 
+@pytest.mark.skip("co-assignment is removed")
 @pytest.mark.parametrize("ndeps", [0, 1, 4])
 @pytest.mark.parametrize(
     "nthreads",
@@ -665,7 +666,7 @@ async def test_no_valid_workers(client, s, a, b, c):
     while not s.tasks:
         await asyncio.sleep(0.01)
 
-    assert s.tasks[x.key] in s.unrunnable
+    assert s.tasks[x.key] in s.queued
 
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(x, 0.05)
@@ -691,12 +692,8 @@ async def test_no_workers(client, s, queue):
         await asyncio.sleep(0.01)
 
     ts = s.tasks[x.key]
-    if queue:
-        assert ts in s.queued
-        assert ts.state == "queued"
-    else:
-        assert ts in s.unrunnable
-        assert ts.state == "no-worker"
+    assert ts in s.queued
+    assert ts.state == "queued"
 
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(x, 0.05)
@@ -1105,7 +1102,7 @@ async def test_restart_nanny_timeout_exceeded(c, s, a, b):
     await wait(f)
     assert s.erred_tasks
     assert s.computations
-    assert s.unrunnable
+    assert s.queued
     assert s.tasks
 
     with pytest.raises(
@@ -1118,7 +1115,7 @@ async def test_restart_nanny_timeout_exceeded(c, s, a, b):
     assert not s.workers
     assert not s.erred_tasks
     assert not s.computations
-    assert not s.unrunnable
+    assert not s.queued
     assert not s.tasks
 
     assert not c.futures
@@ -4252,13 +4249,13 @@ async def test_transition_waiting_memory(c, s, a, b):
     with freeze_batched_send(b.batched_stream):
         with freeze_batched_send(s.stream_comms[b.address]):
             await s.remove_worker(a.address, stimulus_id="remove_a")
-            assert s.tasks["x"].state == "no-worker"
+            assert s.tasks["x"].state == "queued"
             assert s.tasks["y"].state == "waiting"
             await wait_for_state("y", "memory", b)
 
     await async_wait_for(lambda: not b.state.tasks, timeout=5)
 
-    assert s.tasks["x"].state == "no-worker"
+    assert s.tasks["x"].state == "queued"
     assert s.tasks["y"].state == "waiting"
     assert_story(s.story("y"), [("y", "waiting", "waiting", {})])
 
