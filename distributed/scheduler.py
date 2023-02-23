@@ -2067,8 +2067,10 @@ class SchedulerState:
 
         # If the ideal worker would have no data transfer, only pick `other` if it
         # would open opportunities for future parallelism.
+        # FIXME consider soft restrictions here. `ts` may be softly restricted to `ideal`;
+        # how do we decide when to break those restrictions?
         if nbytes_xfer_ideal == 0:
-            if self.validate:
+            if self.validate and not ts.worker_restrictions:
                 assert nbytes_xfer_other > 0, (ts, ideal_ws, other_ws)
 
             return all(
@@ -2853,7 +2855,11 @@ class SchedulerState:
         # 1) occupancy is a poor measure of task start time (doesn't consider open threads)
         # 2) if there's a tie, we should prefer a worker in `idle_task_count`, for
         #    consistency with `decide_worker`
-        score = (nbytes_xfer, len(ws.processing) / ws.nthreads, ws.nbytes)
+        score = (
+            nbytes_xfer,
+            len(ws.processing) - len(ws.long_running) / ws.nthreads,
+            ws.nbytes,
+        )
         if ts.actor:
             return (len(ws.actors),) + score
 
@@ -4527,7 +4533,9 @@ class Scheduler(SchedulerState, ServerNode):
                 roots.append(key)
 
         recommendations: Recs = {key: "waiting" for key in roots}
-        self.transitions(recommendations, f"stimulus-retry-{time()}")
+        stimulus_id = f"stimulus-retry-{time()}"
+        self.transitions(recommendations, stimulus_id=stimulus_id)
+        self.stimulus_queue_slots_maybe_opened(stimulus_id=stimulus_id)
 
         if self.validate:
             for key in seen:

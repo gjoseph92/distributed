@@ -143,7 +143,7 @@ async def test_restart_cleared(c, s, a, b):
 
     await c.restart()
 
-    for coll in [s.tasks, s.unrunnable]:
+    for coll in [s.tasks, s.queued]:
         assert not coll
 
 
