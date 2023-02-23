@@ -2008,6 +2008,13 @@ class SchedulerState:
         )
 
         if not ideal_ws or ideal_ws in self.idle_task_count:
+            # No worker at all valid for the task, or ideal worker also idle.
+            if not ideal_ws:
+                print(f"No worker for {ts}")
+            elif not all(dts in ideal_ws.has_what for dts in ts.dependencies):
+                print(
+                    f"xfer {ts} - {len(ts.dependencies)}, ideal, {[dts.who_has for dts in ts.dependencies]}"
+                )
             return ideal_ws
 
         # The best worker is busy. What's the best idle worker? Is it good enough?
@@ -2017,54 +2024,93 @@ class SchedulerState:
         else:
             valid_workers &= self.idle_task_count
         # TODO inline `decide_worker` to re-use candidates set
-        best_available_ws = decide_worker(
+        best_idle_ws = decide_worker(
             ts,
             self.idle_task_count,
             valid_workers,
             partial(self.worker_objective, ts),
         )
 
-        if self.validate and best_available_ws:
-            assert best_available_ws in self.idle_task_count, best_available_ws
+        if best_idle_ws and self.worker_good_enough(ts, best_idle_ws, ideal_ws):
+            if self.validate:
+                assert best_idle_ws in self.idle_task_count, best_idle_ws
 
-        if best_available_ws and self.worker_good_enough(
-            ts, best_available_ws, ideal_ws
-        ):
-            return best_available_ws
+            if not all(dts in best_idle_ws.has_what for dts in ts.dependencies):
+                print(
+                    f"xfer {ts} - {len(ts.dependencies)}, idle, {[dts.who_has for dts in ts.dependencies]}"
+                )
 
-        # TODO this isn't quite what we want. the goal should be to determine
-        # "is `ts` so specially well-suited to `ideal_ws` that it should run there
-        # no matter what?" if so, then schedule `ts` there now even if `ideal_ws` is full.
-        # if it's not specially well-suited, then idk:
-        # - run it on `best_available` if it's good enough?
-        # - leave it on the queue?
+            return best_idle_ws
+
+        # Since this task is top priority, it should be scheduled immediately, even when
+        # that means adding more tasks to an already-full worker. It's better to wait
+        # slightly longer, but run on the right worker, than to run slightly sooner but
+        # transfer unnecessary data, or to remain on the queue and be passed by
+        # lower-priority tasks.
+
+        if not all(dts in ideal_ws.has_what for dts in ts.dependencies):
+            print(
+                f"xfer {ts} - {len(ts.dependencies)}, ideal after all, {[dts.who_has for dts in ts.dependencies]}"
+            )
 
         return ideal_ws
 
     def worker_good_enough(
         self, ts: TaskState, other_ws: WorkerState, ideal_ws: WorkerState
     ) -> bool:
-        "Whether a worker a 'good enough' candidate for a task, compared to the ideal worker."
+        "Whether a worker 'good enough' for a task, compared to the ideal worker."
+
+        # TODO logically, this metric would be, "will it take less time to transfer data
+        # to `other_ws` than to wait in line on `ideal_ws`". That is, we're only
+        # considering a less-optimal worker because it has an open thread, so logically,
+        # the "busy-ness" of `ideal_ws` would come into play here.
+        #
+        # However, we don't have a good way to evaluate how long a task would wait in
+        # line. Occupancy is very inaccurate: you can commonly have 2-3
+        # order-of-magnitude differences in occupancy between well-balanced workers
+        # running homogeneous tasks. Furthermore, occupancy is especially inaccurate
+        # with low `processing` counts (`len(processing)` ~= `nthreads`), because it
+        # doesn't consider tasks that are already executing, and perhaps even done.
+        #
+        # Therefore, for now, this assessment is just based on data transfer. For short,
+        # homogeneous tasks, this might end up being fine. When task runtimes are
+        # enormous, and transfers small, then it might break down.
+
         if self.validate:
             assert not _worker_full(other_ws, self.WORKER_SATURATION), other_ws
 
-        # TODO we already did the dependency traversal in `worker_objective`;
-        # find a way to reuse that instead of `get_comm_cost`?
-        ideal_comm_cost = self.get_comm_cost(ts, ideal_ws)
-        other_comm_cost = self.get_comm_cost(ts, other_ws)
+        nbytes_xfer_ideal, *_ = self.worker_objective(ts, ideal_ws)
+        nbytes_xfer_other, *_ = self.worker_objective(ts, other_ws)
 
-        if other_comm_cost <= ideal_comm_cost:
-            # Since `other` has a task slot open, it's clearly better if comms are equal
-            return True
-
-        # Occupancy is profoundly inaccurate.
-        # Just use it for an order-of-magnitude comparison.
-        cmp = other_ws.occupancy + other_comm_cost < ideal_ws.occupancy * 100
-        if cmp:
+        if nbytes_xfer_ideal:
             print(
-                f"{other_ws.occupancy + other_comm_cost = }, {ideal_ws.occupancy * 100 = }"
+                f"{ts} {len(ts.dependencies)} {nbytes_xfer_ideal=} {ideal_ws} {len(self.running)}"
             )
-        return cmp
+
+        # If the ideal worker would have no data transfer, only pick `other` if it
+        # would open opportunities for future parallelism.
+        if nbytes_xfer_ideal == 0:
+            if self.validate:
+                assert nbytes_xfer_other > 0, (ts, ideal_ws, other_ws)
+
+            r = all(
+                dts in other_ws.has_what or self.replication_ratio(dts) < 1
+                for dts in ts.dependencies
+            )
+            if r:
+                print(
+                    f"{ts} - {other_ws} good enough vs {ideal_ws} - all deps under-replicated - {len(ts.dependencies)=}"
+                )
+            return r
+
+        # Both would involve transfer. Pick `other` if the amortized transfer cost
+        # isn't much worse.
+        r = nbytes_xfer_other / nbytes_xfer_ideal < 1.5
+        if r:
+            print(
+                f"{ts} - {other_ws} good enough vs {ideal_ws} - {nbytes_xfer_other=}, {nbytes_xfer_ideal=}, {len(ts.dependencies)=}"
+            )
+        return r
 
     def transition_waiting_memory(
         self,
@@ -2803,26 +2849,42 @@ class SchedulerState:
             assert isinstance(host, str)
             return host
 
-    def worker_objective(self, ts: TaskState, ws: WorkerState) -> tuple:
+    def replication_ratio(self, ts: TaskState) -> float:
+        """
+        Approximate ratio of how widely-replicated a task is to how widely-needed it is.
+
+        Tasks with ``replication_ratio`` > 1 are over-replicated: there are more
+        workers (specifically, worker threads) that could run their dependencies
+        than dependencies to run.
+
+        Tasks with ``replication_ratio`` < 1 are parallelism-constrained and beneficial
+        to replicate: they aren't replicated onto enough workers to be able to run all
+        their dependencies in parallel.
+        """
+        assert ts.dependents, ts
+        # Ideally we'd get the actual thread count, but that's too much iteration.
+        avg_thread_count = self.total_nthreads / len(self.workers)
+        return (len(ts.who_has) * avg_thread_count) / len(ts.waiters)
+
+    def worker_objective(self, ts: TaskState, ws: WorkerState) -> tuple[float, ...]:
         "Objective function to determine which worker should get the task"
         nbytes_xfer = 0.0
         for dts in ts.dependencies:
-            size = dts.get_nbytes()
-            if dts in ws.has_what:
-                nbytes_xfer -= size
-            else:
-                # Weight the cost of replicating the dependency by how much it opens
-                # opportunities for future parallelism.
+            if dts not in ws.has_what:
+                assert dts.waiters, (dts, ts, ts.dependencies)
+                # De-weight the cost of replicating the dependency by how much it opens
+                # opportunities for future parallelism ("amortized transfer cost").
 
                 # If lots of tasks need this, and it's not widely replicated, making a
-                # copy now is good, and lowers the replication cost.
-                # If few tasks need it, but it's already widely replicated, making yet
-                # another replica (that probably won't get used again) is a worse choice.
-                nbytes_xfer += size / (len(dts.waiters) / len(dts.who_has))
+                # copy now is useful, so that should lower the replication cost.
+                # If few tasks need it, and it's already widely replicated, making yet
+                # another replica (that probably won't get used again) is a poor choice.
+                nbytes_xfer += dts.get_nbytes() * self.replication_ratio(dts)
 
         # NOTE: we break ties with `len(processing)`, not occupancy, because:
         # 1) occupancy is a poor measure of task start time (doesn't consider open threads)
-        # 2) if there's a tie, we should prefer a worker in `idle_task_count`
+        # 2) if there's a tie, we should prefer a worker in `idle_task_count`, for
+        #    consistency with `decide_worker`
         score = (nbytes_xfer, len(ws.processing) / ws.nthreads, ws.nbytes)
         if ts.actor:
             return (len(ws.actors),) + score
