@@ -2061,6 +2061,7 @@ class SchedulerState:
         if self.validate:
             assert not _worker_full(other_ws, self.WORKER_SATURATION), other_ws
 
+        # TODO reuse values we already calculated
         nbytes_xfer_ideal, *_ = self.worker_objective(ts, ideal_ws)
         nbytes_xfer_other, *_ = self.worker_objective(ts, other_ws)
 
